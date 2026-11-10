@@ -28,12 +28,12 @@ pub use math::{discretize_state, euler_flow_step, pi05_prompt, sinusoidal_time_e
 pub use model::Bf16PrefixKvCache;
 pub use model::Int8DynamicPrefixKvCache;
 pub use model::{
-    action_layer_bf16, build_bf16_model, build_int8_dynamic_model, language_layer_bf16,
-    vision_layer_bf16, vision_patch_embed_bf16, Bf16ActionLayerOutput, Bf16LanguageLayerOutput,
+    action_layer_bf16, build_bf16_model, build_int8_dynamic_model, vision_layer_bf16,
+    vision_patch_embed_bf16, Bf16ActionLayerOutput,
 };
 pub use model::{
-    action_layer_int8_dynamic, language_layer_int8_dynamic, vision_layer_int8_dynamic,
-    vision_patch_embed_int8_dynamic, Int8DynamicActionLayerOutput, Int8DynamicLanguageLayerOutput,
+    action_layer_int8_dynamic, vision_layer_int8_dynamic, vision_patch_embed_int8_dynamic,
+    Int8DynamicActionLayerOutput,
 };
 pub use model_runner::{CapturedGraph, Pi05ModelRunner};
 pub use weights::*;

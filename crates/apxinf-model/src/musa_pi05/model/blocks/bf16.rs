@@ -4,7 +4,7 @@ use crate::musa_pi05::backend::{
     ops::{
         attention as l3_attention, concat_rows as l3_concat_rows, gather as l3_gather,
         gemm as l3_gemm, gemm_geglu as l3_gemm_geglu, pointwise as l3_pointwise,
-        rms_norm as l3_rms_norm, reserve_prefix as l3_reserve_prefix, rope as l3_rope,
+        rms_norm as l3_rms_norm, rope as l3_rope,
         AttentionArgs, GatherArgs, GatherSemantic, GemmArgs, GemmGegluArgs, PointwiseActivation,
         PointwiseArgs, PointwiseSemantic, RmsNormArgs, RopeArgs, RopeSemantic,
     },
@@ -14,19 +14,13 @@ use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use super::{
     adaptive_rms_bf16, bias_residual_bf16, bias_residual_layer_bf16, bias_residual_rms_bf16,
-    bf16_vector_prefix, layer_bf16, QkvTensors, QkvViews, ResidualNormTensors,
+    bf16_vector_prefix, layer_bf16, QkvTensors, ResidualNormTensors,
 };
 use super::L3Policies;
 use crate::musa_pi05::{
     Bf16DeviceActionLayer, Bf16DeviceLanguageLayer, Bf16DeviceVisionBlock, Bf16LinearWeights,
     GemmaVariantConfig,
 };
-
-pub struct Bf16LanguageLayerOutput {
-    pub hidden: Tensor,
-    pub key: Tensor,
-    pub value: Tensor,
-}
 
 pub struct Bf16ActionLayerOutput {
     pub hidden: Tensor,
@@ -271,53 +265,6 @@ fn split_qkv_bias_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn split_qkv_rope_bf16(
-    ctx: &Context,
-    qkv: &Tensor,
-    bias: Option<&Tensor>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    theta: f32,
-    position_offset: usize,
-) -> Result<QkvTensors> {
-    let shape = qkv.shape().dims();
-    let expected_width = (q_heads + 2 * kv_heads)
-        .checked_mul(head_dim)
-        .ok_or_else(|| Error::Other("PI0.5 BF16 QKV width overflow".into()))?;
-    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != expected_width {
-        return Err(Error::Other(
-            "PI0.5 BF16 rotary QKV shape/dtype mismatch".into(),
-        ));
-    }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
-    let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
-    let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
-    let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
-    l3_rope(
-        ctx,
-        RopeArgs {
-            semantic: RopeSemantic::SplitQkvRope,
-            qkv,
-            bias,
-            q: &mut q,
-            k: &mut k,
-            v: &mut v,
-            q_heads,
-            kv_heads,
-            head_dim,
-            theta,
-            position_offset,
-            kv_output_offset: 0,
-        },
-    )?;
-    Ok(QkvTensors { q, k, v })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn split_qkv_rope_into_cache_bf16(
     ctx: &Context,
     qkv: &Tensor,
@@ -399,30 +346,6 @@ fn adaptive_gate_residual_rms_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn language_layer_bf16(
-    ctx: &Context,
-    config: GemmaVariantConfig,
-    weights: &Bf16DeviceLanguageLayer,
-    input: &Tensor,
-    compute_tail: bool,
-    position_offset: usize,
-    rms_eps: f32,
-    rope_theta: f32,
-) -> Result<Bf16LanguageLayerOutput> {
-    language_layer_bf16_with_policies(
-        ctx,
-        &L3Policies::default(),
-        config,
-        weights,
-        input,
-        compute_tail,
-        position_offset,
-        rms_eps,
-        rope_theta,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn language_layer_bf16_with_policies(
     ctx: &Context,
     policies: &L3Policies,
@@ -431,12 +354,14 @@ fn language_layer_bf16_with_policies(
     input: &Tensor,
     compute_tail: bool,
     position_offset: usize,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
     rms_eps: f32,
     rope_theta: f32,
-) -> Result<Bf16LanguageLayerOutput> {
+) -> Result<Tensor> {
     let normalized = rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
     let qkv = gemm_bf16(ctx, policies, &normalized, &weights.qkv.weight)?;
-    let qkv = split_qkv_rope_bf16(
+    let q = split_qkv_rope_into_cache_bf16(
         ctx,
         &qkv,
         weights.qkv.bias.as_ref(),
@@ -444,17 +369,19 @@ fn language_layer_bf16_with_policies(
         config.num_kv_heads,
         config.head_dim,
         rope_theta,
+        // The prefix writes the cache's first rows: its positions and its
+        // cache rows both start at zero, and the action expert appends the
+        // remaining rows at its own offset.
         position_offset,
+        0,
+        key_cache,
+        value_cache,
     )?;
     let tokens = input.shape().dims()[0];
     if !compute_tail {
-        return Ok(Bf16LanguageLayerOutput {
-            hidden: input.clone(),
-            key: qkv.key_2d(tokens, config.head_dim)?,
-            value: qkv.value_2d(tokens, config.head_dim)?,
-        });
+        return Ok(input.clone());
     }
-    let attention = mqa_bf16(ctx, policies, &qkv.q, &qkv.k, &qkv.v, tokens)?
+    let attention = mqa_bf16(ctx, policies, &q, key_cache, value_cache, tokens)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
     let projected = gemm_bf16(ctx, policies, &attention, &weights.output.weight)?;
     let fused = bias_residual_rms_bf16(
@@ -469,11 +396,7 @@ fn language_layer_bf16_with_policies(
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
     let hidden =
         bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
-    Ok(Bf16LanguageLayerOutput {
-        hidden,
-        key: qkv.key_2d(tokens, config.head_dim)?,
-        value: qkv.value_2d(tokens, config.head_dim)?,
-    })
+    Ok(hidden)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -815,8 +738,20 @@ pub(in crate::musa_pi05::model) mod backbone {
             let mut hidden = prefix.clone();
             let mut keys = Vec::with_capacity(self.config.language.depth);
             let mut values = Vec::with_capacity(self.config.language.depth);
+            let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
             for (index, layer) in self.weights.language_layers.iter().enumerate() {
-                let output = language_layer_bf16_with_policies(
+                // Each layer writes its prefix K/V straight into the flat cache
+                // the action expert later appends to, at row zero through the
+                // same rope entry it uses; no staging copy is made.
+                let key_cache = self.ctx().allocate_output(
+                    Shape::new(vec![cache_rows, self.config.language.head_dim]),
+                    DType::BF16,
+                )?;
+                let value_cache = self.ctx().allocate_output(
+                    Shape::new(vec![cache_rows, self.config.language.head_dim]),
+                    DType::BF16,
+                )?;
+                hidden = language_layer_bf16_with_policies(
                     self.ctx(),
                     &self.policies,
                     self.config.language,
@@ -824,13 +759,13 @@ pub(in crate::musa_pi05::model) mod backbone {
                     &hidden,
                     index + 1 < self.config.language.depth,
                     0,
+                    &key_cache,
+                    &value_cache,
                     self.config.rms_norm_eps,
                     self.config.rope_theta,
                 )?;
-                hidden = output.hidden;
-                let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
-                keys.push(l3_reserve_prefix(self.ctx(), &output.key, cache_rows)?);
-                values.push(l3_reserve_prefix(self.ctx(), &output.value, cache_rows)?);
+                keys.push(key_cache);
+                values.push(value_cache);
             }
             Ok(Bf16PrefixKvCache {
                 keys,

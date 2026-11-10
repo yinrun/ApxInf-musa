@@ -8,19 +8,13 @@ use super::{
     bias_residual_bf16 as l3_bias_residual_bf16,
     bias_residual_layer_bf16 as l3_bias_residual_layer_bf16,
     bias_residual_rms_bf16 as l3_bias_residual_rms_bf16, layer_bf16 as l3_layer_bf16, QkvTensors,
-    QkvViews, ResidualNormTensors,
+    ResidualNormTensors,
 };
 
 use crate::musa_pi05::{
     GemmaVariantConfig, Int8DynamicDeviceActionLayer, Int8DynamicDeviceLanguageLayer,
     Int8DynamicDeviceVisionBlock, Int8DynamicLinearWeights,
 };
-
-pub struct Int8DynamicLanguageLayerOutput {
-    pub hidden: Tensor,
-    pub key: Tensor,
-    pub value: Tensor,
-}
 
 pub struct Int8DynamicActionLayerOutput {
     pub hidden: Tensor,
@@ -301,53 +295,6 @@ fn l3_split_qkv_bias_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn l3_split_qkv_rope_bf16(
-    ctx: &Context,
-    qkv: &Tensor,
-    bias: Option<&Tensor>,
-    q_heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    theta: f32,
-    position_offset: usize,
-) -> Result<QkvTensors> {
-    let shape = qkv.shape().dims();
-    let expected_width = (q_heads + 2 * kv_heads)
-        .checked_mul(head_dim)
-        .ok_or_else(|| Error::Other("PI0.5 INT8 QKV width overflow".into()))?;
-    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != expected_width {
-        return Err(Error::Other(
-            "PI0.5 INT8 rotary QKV shape/dtype mismatch".into(),
-        ));
-    }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
-    let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
-    let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
-    let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
-    ops::rope(
-        ctx,
-        ops::RopeArgs {
-            semantic: ops::RopeSemantic::SplitQkvRope,
-            qkv,
-            bias,
-            q: &mut q,
-            k: &mut k,
-            v: &mut v,
-            q_heads,
-            kv_heads,
-            head_dim,
-            theta,
-            position_offset,
-            kv_output_offset: 0,
-        },
-    )?;
-    Ok(QkvTensors { q, k, v })
-}
-
-#[allow(clippy::too_many_arguments)]
 fn l3_split_qkv_rope_into_cache_bf16(
     ctx: &Context,
     qkv: &Tensor,
@@ -472,16 +419,18 @@ fn language_layer_int8_dynamic_with_policies(
     input: &Tensor,
     compute_tail: bool,
     position_offset: usize,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
     rms_eps: f32,
     rope_theta: f32,
     policies: &Int8DynamicL3Policies,
-) -> Result<Int8DynamicLanguageLayerOutput> {
+) -> Result<Tensor> {
     let normalized = l3_rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
     report_row_levels("lang.qkv_in", &normalized);
     let qkv = weights
         .qkv
         .gemm_with_policies(ctx, &normalized, &policies.gemm)?;
-    let qkv = l3_split_qkv_rope_bf16(
+    let q = l3_split_qkv_rope_into_cache_bf16(
         ctx,
         &qkv,
         weights.qkv.bias.as_ref(),
@@ -489,17 +438,19 @@ fn language_layer_int8_dynamic_with_policies(
         config.num_kv_heads,
         config.head_dim,
         rope_theta,
+        // The prefix writes the cache's first rows: its positions and its
+        // cache rows both start at zero, and the action expert appends the
+        // remaining rows at its own offset.
         position_offset,
+        0,
+        key_cache,
+        value_cache,
     )?;
     let tokens = input.shape().dims()[0];
     if !compute_tail {
-        return Ok(Int8DynamicLanguageLayerOutput {
-            hidden: input.clone(),
-            key: qkv.key_2d(tokens, config.head_dim)?,
-            value: qkv.value_2d(tokens, config.head_dim)?,
-        });
+        return Ok(input.clone());
     }
-    let attention = l3_mqa_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, tokens, &policies.attention)?
+    let attention = l3_mqa_bf16(ctx, &q, key_cache, value_cache, tokens, &policies.attention)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
     report_row_levels("lang.o_proj_in", &attention);
     let projected = weights
@@ -536,35 +487,7 @@ fn language_layer_int8_dynamic_with_policies(
         weights.down.bias.as_ref(),
         &fused.hidden,
     )?;
-    Ok(Int8DynamicLanguageLayerOutput {
-        hidden,
-        key: qkv.key_2d(tokens, config.head_dim)?,
-        value: qkv.value_2d(tokens, config.head_dim)?,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn language_layer_int8_dynamic(
-    ctx: &Context,
-    config: GemmaVariantConfig,
-    weights: &Int8DynamicDeviceLanguageLayer,
-    input: &Tensor,
-    compute_tail: bool,
-    position_offset: usize,
-    rms_eps: f32,
-    rope_theta: f32,
-) -> Result<Int8DynamicLanguageLayerOutput> {
-    language_layer_int8_dynamic_with_policies(
-        ctx,
-        config,
-        weights,
-        input,
-        compute_tail,
-        position_offset,
-        rms_eps,
-        rope_theta,
-        &Int8DynamicL3Policies::default(),
-    )
+    Ok(hidden)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,22 +869,34 @@ pub(in crate::musa_pi05::model) mod backbone {
             let mut hidden = prefix.clone();
             let mut keys = Vec::with_capacity(self.config.language.depth);
             let mut values = Vec::with_capacity(self.config.language.depth);
+            let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
             for (index, layer) in self.weights.language_layers.iter().enumerate() {
-                let output = language_layer_int8_dynamic_with_policies(
+                // Each layer writes its prefix K/V straight into the flat cache
+                // the action expert later appends to, at row zero through the
+                // same rope entry it uses; no staging copy is made.
+                let key_cache = self.ctx().allocate_output(
+                    Shape::new(vec![cache_rows, self.config.language.head_dim]),
+                    DType::BF16,
+                )?;
+                let value_cache = self.ctx().allocate_output(
+                    Shape::new(vec![cache_rows, self.config.language.head_dim]),
+                    DType::BF16,
+                )?;
+                hidden = language_layer_int8_dynamic_with_policies(
                     self.ctx(),
                     self.config.language,
                     layer,
                     &hidden,
                     index + 1 < self.config.language.depth,
                     0,
+                    &key_cache,
+                    &value_cache,
                     self.config.rms_norm_eps,
                     self.config.rope_theta,
                     &self.policies,
                 )?;
-                hidden = output.hidden;
-                let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
-                keys.push(ops::reserve_prefix(self.ctx(), &output.key, cache_rows)?);
-                values.push(ops::reserve_prefix(self.ctx(), &output.value, cache_rows)?);
+                keys.push(key_cache);
+                values.push(value_cache);
             }
             Ok(Int8DynamicPrefixKvCache {
                 keys,

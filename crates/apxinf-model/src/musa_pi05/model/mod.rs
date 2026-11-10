@@ -75,12 +75,11 @@ impl<B: PrepareBlocks> Pi05Model<B> {
 }
 
 pub use blocks::bf16::{
-    action_layer_bf16, language_layer_bf16, vision_layer_bf16, vision_patch_embed_bf16,
-    Bf16ActionLayerOutput, Bf16LanguageLayerOutput,
+    action_layer_bf16, vision_layer_bf16, vision_patch_embed_bf16, Bf16ActionLayerOutput,
 };
 pub use blocks::int8_dynamic::{
-    action_layer_int8_dynamic, language_layer_int8_dynamic, vision_layer_int8_dynamic,
-    vision_patch_embed_int8_dynamic, Int8DynamicActionLayerOutput, Int8DynamicLanguageLayerOutput,
+    action_layer_int8_dynamic, vision_layer_int8_dynamic, vision_patch_embed_int8_dynamic,
+    Int8DynamicActionLayerOutput,
 };
 pub use blocks::Bf16PrefixKvCache;
 pub use blocks::Int8DynamicPrefixKvCache;

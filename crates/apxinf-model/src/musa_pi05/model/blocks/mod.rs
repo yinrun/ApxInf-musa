@@ -128,21 +128,6 @@ pub(super) struct QkvTensors {
     pub(super) v: Tensor,
 }
 
-pub(super) trait QkvViews {
-    fn key_2d(&self, tokens: usize, head_dim: usize) -> Result<Tensor>;
-    fn value_2d(&self, tokens: usize, head_dim: usize) -> Result<Tensor>;
-}
-
-impl QkvViews for QkvTensors {
-    fn key_2d(&self, tokens: usize, head_dim: usize) -> Result<Tensor> {
-        self.k.reshape(vec![tokens, head_dim])
-    }
-
-    fn value_2d(&self, tokens: usize, head_dim: usize) -> Result<Tensor> {
-        self.v.reshape(vec![tokens, head_dim])
-    }
-}
-
 pub(super) struct ResidualNormTensors {
     pub(super) hidden: Tensor,
     pub(super) normalized: Tensor,
