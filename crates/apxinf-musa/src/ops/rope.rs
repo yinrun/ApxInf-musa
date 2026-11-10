@@ -17,9 +17,12 @@ pub enum RopeSemantic {
 
 /// Splits a packed QKV projection into separate Q, K and V buffers.
 ///
-/// `k` and `v` may point either at fresh per-call buffers (`kv_output_offset`
-/// zero) or into a KV cache, in which case `kv_output_offset` is the row at
-/// which this call's tokens are appended and the kernel writes in place.
+/// `k` and `v` may point either at fresh per-call buffers, which are
+/// `[tokens, kv_heads, head_dim]`, or into a 2-D `[rows, head_dim]` KV cache,
+/// in which case `kv_output_offset` is the row at which this call's tokens are
+/// appended and the kernel writes in place. The buffers' rank selects the
+/// form, not the offset: a prefix that writes a cache's first rows appends at
+/// offset zero.
 pub struct RopeArgs<'a> {
     pub semantic: RopeSemantic,
     pub qkv: &'a Tensor,
@@ -37,29 +40,22 @@ pub struct RopeArgs<'a> {
 
 pub fn rope(ctx: &MusaContext, args: RopeArgs<'_>) -> Result<()> {
     match args.semantic {
-        RopeSemantic::SplitQkvRope => match args.kv_output_offset {
-            0 => rope_kernels::split_qkv_apply_bf16_into(
-                ctx,
-                args.qkv,
-                args.bias,
-                args.q,
-                args.k,
-                args.v,
-                args.q_heads,
-                args.kv_heads,
-                args.head_dim,
-                args.theta,
-                args.position_offset,
-            ),
-            // The cache case: the kernel writes K/V at the offset and returns
-            // Q alone, so the borrowed k/v view is the cache itself.
-            _ => {
+        RopeSemantic::SplitQkvRope => {
+            // Rank, not the offset, picks the form: fresh per-call splits are
+            // `[tokens, kv_heads, head_dim]`, while a KV cache is 2-D
+            // `[rows, head_dim]` the kernel appends to at `kv_output_offset`.
+            // A prefix writing a cache's first rows appends at offset zero, so
+            // a zero offset alone cannot mean "fresh buffers".
+            if args.k.shape().dims().len() == 2 {
                 if args.kv_heads != 1 {
                     return Err(Error::Other(format!(
                         "MUSA rope cache write requires kv_heads == 1, got {}",
                         args.kv_heads
                     )));
                 }
+                // The cache case: the kernel writes K/V at the offset and
+                // returns Q alone, so the borrowed k/v view is the cache
+                // itself.
                 rope_kernels::apply_q_write_kv_bf16_into(
                     ctx,
                     args.qkv,
@@ -74,8 +70,27 @@ pub fn rope(ctx: &MusaContext, args: RopeArgs<'_>) -> Result<()> {
                     args.v,
                     args.kv_output_offset,
                 )
+            } else {
+                if args.kv_output_offset != 0 {
+                    return Err(Error::Other(
+                        "MUSA rope fresh-buffer split has no KV-cache offset".into(),
+                    ));
+                }
+                rope_kernels::split_qkv_apply_bf16_into(
+                    ctx,
+                    args.qkv,
+                    args.bias,
+                    args.q,
+                    args.k,
+                    args.v,
+                    args.q_heads,
+                    args.kv_heads,
+                    args.head_dim,
+                    args.theta,
+                    args.position_offset,
+                )
             }
-        },
+        }
         RopeSemantic::SplitQkvBias => {
             if args.kv_output_offset != 0 {
                 return Err(Error::Other(
