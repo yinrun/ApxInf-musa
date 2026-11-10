@@ -411,7 +411,21 @@ class BoundaryRecorder:
     def _capture_prefix_kv(self, past_key_values) -> None:
         keys = getattr(past_key_values, "key_cache", None)
         values = getattr(past_key_values, "value_cache", None)
-        if keys is None or values is None or len(keys) != len(values):
+        if keys is None or values is None:
+            # Transformers 4.54 moved the per-layer tensors off the
+            # `key_cache`/`value_cache` lists onto `layers[i].keys` and
+            # `layers[i].values`; the vendored Gemma builds its cache from
+            # the installed transformers, so both shapes must be read.
+            layers = getattr(past_key_values, "layers", None) or ()
+            keys = [getattr(layer, "keys", None) for layer in layers]
+            values = [getattr(layer, "values", None) for layer in layers]
+        if (
+            not keys
+            or not values
+            or len(keys) != len(values)
+            or any(key is None for key in keys)
+            or any(value is None for value in values)
+        ):
             raise RuntimeError(
                 "sample_actions produced no usable prefix KV cache; the vendored PaliGemma cache API changed"
             )
