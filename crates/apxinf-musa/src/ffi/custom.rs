@@ -40,8 +40,23 @@ extern "C" {
         dim: i32,
         stream: *mut c_void,
     ) -> i32;
-    /// Why the last muDNN call on this thread failed. A static string.
-    pub fn apxinf_musa_mudnn_last_error() -> *const std::os::raw::c_char;
+    /// qwen38 BF16 SDPA. K/V retain native GQA `kv_heads`; `causal` is used
+    /// only when q_tokens == k_tokens (prefill). Decode uses non-causal mode.
+    pub fn apxinf_musa_qwen38_mudnn_sdpa_bf16(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        y: *mut c_void,
+        batch: i32,
+        heads: i32,
+        kv_heads: i32,
+        q_tokens: i32,
+        k_tokens: i32,
+        dim: i32,
+        causal: i32,
+        stream: *mut c_void,
+    ) -> i32;
+
     /// `bias + activation(input)`, elementwise over a row-major `[rows, cols]`
     /// BF16 buffer.
     ///
@@ -392,6 +407,122 @@ extern "C" {
         rows: i32,
         cols: i32,
         inv_c: *const c_void,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    // ── qwen38 (Qwen3.8-27B) ──────────────────────────────────────────────
+    /// GDN fused recurrent step: `state` is `[v_heads, v_dim, k_dim]` F32,
+    /// read-modify-write in place; q/k `[k_heads, k_dim]`, v `[v_heads, v_dim]`
+    /// BF16; decay/beta `[v_heads]` F32 (decay is log-space; kernel applies
+    /// exp); out `[v_heads, v_dim]` BF16.
+    pub fn apxinf_musa_qwen38_gdn_recurrent_step(
+        state: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        decay: *const c_void,
+        beta: *const c_void,
+        out: *mut c_void,
+        v_heads: i32,
+        k_heads: i32,
+        v_dim: i32,
+        k_dim: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Single-token decay/beta: a/b/a_log/dt_bias `[heads]` BF16 ->
+    /// `decay = -exp(A_log) * softplus(a + dt_bias)`, `beta = sigmoid(b)`,
+    /// both `[heads]` F32.
+    pub fn apxinf_musa_qwen38_gdn_decay_beta_step(
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        decay: *mut c_void,
+        beta: *mut c_void,
+        heads: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Sequence variant over `[tokens, heads]` (batch-first rows).
+    pub fn apxinf_musa_qwen38_gdn_decay_beta_sequence(
+        a: *const c_void,
+        b: *const c_void,
+        a_log: *const c_void,
+        dt_bias: *const c_void,
+        decay: *mut c_void,
+        beta: *mut c_void,
+        tokens: i32,
+        heads: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Causal conv over a whole sequence: input `[tokens, channels]` BF16,
+    /// weight `[channels, width]` BF16, out `[tokens, channels]` BF16 with
+    /// zero left-padding and silu.
+    pub fn apxinf_musa_qwen38_gdn_causal_conv_forward(
+        input: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        tokens: i32,
+        channels: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Decode causal conv: `window` `[channels, width]` F32 shift-register
+    /// advanced in place by one BF16 token.
+    pub fn apxinf_musa_qwen38_gdn_causal_conv_step(
+        window: *mut c_void,
+        input: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        channels: i32,
+        width: i32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Per-head L2 normalization, in place, `[heads, head_dim]` BF16.
+    pub fn apxinf_musa_qwen38_gdn_l2_normalize_heads(
+        data: *mut c_void,
+        heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// `dst[i] += src[i]` over `numel` BF16 elements.
+    pub fn apxinf_musa_qwen38_add_into(
+        dst: *mut c_void,
+        src: *const c_void,
+        numel: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// Split fused `[rows, 2*cols]` (q then gate) into q/gate `[rows, cols]`.
+    pub fn apxinf_musa_qwen38_split_query_and_gate(
+        fused: *const c_void,
+        q: *mut c_void,
+        gate: *mut c_void,
+        rows: i64,
+        cols: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+    /// `out[i] *= sigmoid(gate[i])` over `numel` BF16 elements.
+    pub fn apxinf_musa_qwen38_apply_output_gate(
+        out: *mut c_void,
+        gate: *const c_void,
+        numel: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    /// Sectioned mRoPE, in place: data `[tokens, heads, head_dim]` BF16,
+    /// positions `[tokens, 3]` I32; half-split pairing, axes cycling T/H/W
+    /// (`section_t` is accepted for symmetry and carried in the ABI).
+    pub fn apxinf_musa_qwen38_rope(
+        data: *mut c_void,
+        positions: *const c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        theta: f32,
+        section_t: i32,
+        section_h: i32,
+        section_w: i32,
         stream: *mut c_void,
     ) -> musaError_t;
 }

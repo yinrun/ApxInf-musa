@@ -47,6 +47,7 @@ namespace {
 #include "../kernels/custom/fused.cuh"
 #include "../kernels/custom/preprocess.cuh"
 #include "../kernels/custom/quantization.cuh"
+#include "../kernels/custom/qwen38.cuh"
 }  // namespace
 
 extern "C" musaError_t apxinf_musa_capture_anchor(musaStream_t stream) {
@@ -922,5 +923,148 @@ extern "C" musaError_t apxinf_musa_geglu_quantize_rows_bf16_int8(
     geglu_quantize_rows_bf16_int8_lanes_kernel<2><<<rows, 1024, 0, stream>>>(
         source, destination, row_scales, rows, cols, factors);
   }
+  return musaGetLastError();
+}
+
+
+// ── qwen38 (Qwen3.8-27B) kernels ──────────────────────────────────────────
+
+extern "C" musaError_t apxinf_musa_qwen38_gdn_recurrent_step(
+    void* state, const void* q, const void* k, const void* v,
+    const void* decay, const void* beta, void* out, int v_heads, int k_heads,
+    int v_dim, int k_dim, musaStream_t stream) {
+  if (state == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+      decay == nullptr || beta == nullptr || out == nullptr || v_heads <= 0 ||
+      k_heads <= 0 || v_dim <= 0 || k_dim <= 0) {
+    return musaErrorInvalidValue;
+  }
+  qwen38_gdn_recurrent_step_kernel<<<v_heads, v_dim, 0, stream>>>(
+      static_cast<float*>(state), static_cast<const __mt_bfloat16*>(q),
+      static_cast<const __mt_bfloat16*>(k), static_cast<const __mt_bfloat16*>(v),
+      static_cast<const float*>(decay), static_cast<const float*>(beta),
+      static_cast<__mt_bfloat16*>(out), v_heads, k_heads, v_dim, k_dim);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_gdn_decay_beta_step(
+    const void* a, const void* b, const void* a_log, const void* dt_bias,
+    void* decay, void* beta, int heads, musaStream_t stream) {
+  if (a == nullptr || b == nullptr || a_log == nullptr || dt_bias == nullptr ||
+      decay == nullptr || beta == nullptr || heads <= 0) {
+    return musaErrorInvalidValue;
+  }
+  qwen38_gdn_decay_beta_step_kernel<<<elementwise_grid(heads), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(a), static_cast<const __mt_bfloat16*>(b),
+      static_cast<const __mt_bfloat16*>(a_log),
+      static_cast<const __mt_bfloat16*>(dt_bias), static_cast<float*>(decay),
+      static_cast<float*>(beta), heads);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_gdn_decay_beta_sequence(
+    const void* a, const void* b, const void* a_log, const void* dt_bias,
+    void* decay, void* beta, int tokens, int heads, musaStream_t stream) {
+  if (a == nullptr || b == nullptr || a_log == nullptr || dt_bias == nullptr ||
+      decay == nullptr || beta == nullptr || tokens <= 0 || heads <= 0) {
+    return musaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(tokens) * heads;
+  qwen38_gdn_decay_beta_sequence_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(a), static_cast<const __mt_bfloat16*>(b),
+      static_cast<const __mt_bfloat16*>(a_log),
+      static_cast<const __mt_bfloat16*>(dt_bias), static_cast<float*>(decay),
+      static_cast<float*>(beta), tokens, heads);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_gdn_causal_conv_forward(
+    const void* input, const void* weight, void* out, int tokens, int channels,
+    int width, musaStream_t stream) {
+  if (input == nullptr || weight == nullptr || out == nullptr || tokens <= 0 ||
+      channels <= 0 || width <= 0 || width > 8) {
+    return musaErrorInvalidValue;
+  }
+  qwen38_gdn_causal_conv_forward_kernel<<<elementwise_grid(channels), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<const __mt_bfloat16*>(weight),
+      static_cast<__mt_bfloat16*>(out), tokens, channels, width);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_gdn_causal_conv_step(
+    void* window, const void* input, const void* weight, void* out,
+    int channels, int width, musaStream_t stream) {
+  if (window == nullptr || input == nullptr || weight == nullptr ||
+      out == nullptr || channels <= 0 || width <= 0 || width > 8) {
+    return musaErrorInvalidValue;
+  }
+  qwen38_gdn_causal_conv_step_kernel<<<elementwise_grid(channels), kThreads, 0, stream>>>(
+      static_cast<float*>(window), static_cast<const __mt_bfloat16*>(input),
+      static_cast<const __mt_bfloat16*>(weight), static_cast<__mt_bfloat16*>(out),
+      channels, width);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_gdn_l2_normalize_heads(
+    void* data, int heads, int head_dim, float eps, musaStream_t stream) {
+  if (data == nullptr || heads <= 0 || head_dim <= 0 || head_dim > 1024) {
+    return musaErrorInvalidValue;
+  }
+  const int threads = head_dim < kThreads ? head_dim : kThreads;
+  qwen38_gdn_l2_normalize_heads_kernel<<<heads, threads, 0, stream>>>(
+      static_cast<__mt_bfloat16*>(data), heads, head_dim, eps);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_add_into(
+    void* dst, const void* src, long long numel, musaStream_t stream) {
+  if (dst == nullptr || src == nullptr || numel <= 0) {
+    return musaErrorInvalidValue;
+  }
+  qwen38_add_into_kernel<<<elementwise_grid(numel), kThreads, 0, stream>>>(
+      static_cast<__mt_bfloat16*>(dst), static_cast<const __mt_bfloat16*>(src),
+      numel);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_split_query_and_gate(
+    const void* fused, void* q, void* gate, long long rows, long long cols,
+    musaStream_t stream) {
+  if (fused == nullptr || q == nullptr || gate == nullptr || rows <= 0 ||
+      cols <= 0) {
+    return musaErrorInvalidValue;
+  }
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  qwen38_split_query_and_gate_kernel<<<elementwise_grid(count), kThreads, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(fused), static_cast<__mt_bfloat16*>(q),
+      static_cast<__mt_bfloat16*>(gate), rows, cols);
+  return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_apply_output_gate(
+    void* out, const void* gate, long long numel, musaStream_t stream) {
+  if (out == nullptr || gate == nullptr || numel <= 0) {
+    return musaErrorInvalidValue;
+  }
+  qwen38_apply_output_gate_kernel<<<elementwise_grid(numel), kThreads, 0, stream>>>(
+      static_cast<__mt_bfloat16*>(out), static_cast<const __mt_bfloat16*>(gate),
+      numel);
+  return musaGetLastError();
+}
+
+
+extern "C" musaError_t apxinf_musa_qwen38_rope(
+    void* data, const void* positions, int tokens, int heads, int head_dim,
+    int rotary_dim, float theta, int section_t, int section_h, int section_w,
+    musaStream_t stream) {
+  if (data == nullptr || positions == nullptr || tokens <= 0 || heads <= 0 ||
+      head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim ||
+      rotary_dim % 2 != 0) {
+    return musaErrorInvalidValue;
+  }
+  dim3 grid(tokens, heads);
+  qwen38_rope_kernel<<<grid, rotary_dim / 2, 0, stream>>>(
+      static_cast<__mt_bfloat16*>(data), static_cast<const int*>(positions),
+      heads, head_dim, rotary_dim, theta, section_h, section_w);
   return musaGetLastError();
 }

@@ -23,6 +23,8 @@ pub mod fused;
 pub mod gemm;
 pub mod norm;
 pub mod preprocess;
+#[cfg(apxinf_musa_available)]
+pub mod qwen38;
 pub mod rope;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};

@@ -95,42 +95,56 @@ struct Matmul {
     check(operation.SetDeterministic(true));
   }
 };
-struct Flash {
-  md::Tensor q,k,v,y,lse,mask,dropout;
+// qwen38 SDPA uses its own shape-keyed descriptor cache. The qwen38 model
+// supplies batch-first logical tensors with the physical strides required by
+// mudnn: [batch, heads, seq, dim] descriptor, memory ordered [batch, seq,
+// heads, dim]. KV-cache decode deliberately sets causal=false: every cached
+// key is historical, while mudnn's causal q!=k alignment is top-left rather
+// than qwen's query-at-end alignment.
+struct Qwen38Sdpa {
+  md::Tensor q, k, v, y, lse, mask, dropout;
   md::ScaledDotProductAttention operation;
   Scratch scratch;
   void* lse_buffer = nullptr;
-  Flash(int batch,int heads,int tokens,int dim,musaStream_t stream) : scratch(stream) {
-    for(auto p:{&q,&k,&v,&y,&mask}) check(p->SetType(md::Tensor::Type::BFLOAT16));
-    for(auto p:{&q,&k,&v,&y}) check(p->SetNdInfo({batch,heads,tokens,dim},
-      {tokens*heads*dim,dim,heads*dim,1}));
-    check(lse.SetType(md::Tensor::Type::FLOAT)); check(lse.SetNdInfo({batch,heads,tokens}));
+  Qwen38Sdpa(int batch, int heads, int kv_heads, int q_tokens, int k_tokens,
+             bool causal, musaStream_t stream) : scratch(stream) {
+    const int dim = 256;
+    for (auto p : {&q, &k, &v, &y}) check(p->SetType(md::Tensor::Type::BFLOAT16));
+    check(q.SetNdInfo({batch, heads, q_tokens, dim},
+                      {q_tokens * heads * dim, dim, heads * dim, 1}));
+    check(y.SetNdInfo({batch, heads, q_tokens, dim},
+                      {q_tokens * heads * dim, dim, heads * dim, 1}));
+    check(k.SetNdInfo({batch, kv_heads, k_tokens, dim},
+                      {k_tokens * kv_heads * dim, dim, kv_heads * dim, 1}));
+    check(v.SetNdInfo({batch, kv_heads, k_tokens, dim},
+                      {k_tokens * kv_heads * dim, dim, kv_heads * dim, 1}));
+    check(lse.SetType(md::Tensor::Type::FLOAT));
+    check(lse.SetNdInfo({batch, heads, q_tokens}));
     check(mask.SetNdInfo({0}));
-    check(dropout.SetType(md::Tensor::Type::FLOAT)); check(dropout.SetNdInfo({0}));
-    check(operation.SetBatchSize(batch)); check(operation.SetHeadsNum(heads));
-    check(operation.SetEmbedDim(heads*dim)); check(operation.SetScale(1./std::sqrt(double(dim))));
-    check(operation.SetCausal(false)); check(operation.SetMaskMode(false));
-    check(operation.SetTraining(false)); check(operation.SetDropoutP(0));
-    // Pinned, like Matmul above and for the same reason: a captured graph is
-    // only worth capturing if replaying it twice gives one answer twice. The
-    // vendor default is not documented as reproducible, and one run of this
-    // binary against a fixed fixture has disagreed with three others at the
-    // sixth significant digit of the end-to-end cosine with no input differing.
+    check(dropout.SetType(md::Tensor::Type::FLOAT));
+    check(dropout.SetNdInfo({0}));
+    check(operation.SetBatchSize(batch));
+    check(operation.SetHeadsNum(heads));
+    check(operation.SetEmbedDim(heads * dim));
+    check(operation.SetScale(1.0 / std::sqrt(double(dim))));
+    check(operation.SetCausal(causal));
+    check(operation.SetMaxSeqlenQ(q_tokens));
+    check(operation.SetMaxSeqlenK(k_tokens));
+    check(operation.SetMaskMode(false));
+    check(operation.SetTraining(false));
+    check(operation.SetDropoutP(0));
     check(operation.SetIsDeterministic(true));
-    // Last, so no later `check` can throw past an owned allocation. A throwing
-    // constructor does not run `~Flash` (only the members'), and a rejected
-    // shape re-runs the constructor on every call -- `make_unique` never
-    // inserts it -- so a leak here would repeat rather than happen once.
-    if(musaMalloc(&lse_buffer,size_t(batch)*heads*tokens*sizeof(float))!=musaSuccess)
+    if (musaMalloc(&lse_buffer, size_t(batch) * heads * q_tokens * sizeof(float)) != musaSuccess)
       throw StatusError{kStatusAllocationFailed};
     check(lse.SetAddr(lse_buffer));
   }
-  ~Flash() { if(lse_buffer) musaFree(lse_buffer); }
+  ~Qwen38Sdpa() { if (lse_buffer) musaFree(lse_buffer); }
 };
 struct Stream {
   md::Handle handle;
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
+  std::map<std::tuple<int,int,int,int,int,bool>,std::unique_ptr<Qwen38Sdpa>> qwen38_sdpa;
   Stream(int device,musaStream_t stream) : handle(device) {
     check(handle.SetStream(stream)); check(handle.SetAllowTF32(false));
   }
@@ -249,6 +263,46 @@ extern "C" int apxinf_musa_mudnn_flash_bf16(const void* q,const void* k,const vo
  } catch(...) {
    record_failure(kStatusUnknown, "muDNN flash attention");
    return kStatusUnknown;
+ }
+}
+
+extern "C" int apxinf_musa_qwen38_mudnn_sdpa_bf16(
+ const void* q, const void* k, const void* v, void* y,
+ int batch, int heads, int kv_heads, int q_tokens, int k_tokens, int dim,
+ int causal, musaStream_t stream) {
+ if(!q||!k||!v||!y||batch<=0||heads<=0||kv_heads<=0||q_tokens<=0||k_tokens<=0||dim!=256||
+    heads % kv_heads != 0 || (causal && q_tokens != k_tokens)) {
+  record_failure(kStatusInvalidArgument, "qwen38 muDNN SDPA");
+  return kStatusInvalidArgument;
+ }
+ try {
+  auto& s=state(stream);
+  auto key=std::make_tuple(batch,heads,kv_heads,q_tokens,k_tokens,causal!=0);
+  auto it=s.qwen38_sdpa.find(key);
+  if(it==s.qwen38_sdpa.end()) {
+   if(capturing(stream)) {
+    record_failure(kStatusCaptureInProgress, "qwen38 muDNN SDPA");
+    return kStatusCaptureInProgress;
+   }
+   it=s.qwen38_sdpa.emplace(key,std::make_unique<Qwen38Sdpa>(
+       batch,heads,kv_heads,q_tokens,k_tokens,causal!=0,stream)).first;
+  }
+  auto& p=*it->second;
+  check(p.q.SetAddr(const_cast<void*>(q)));
+  check(p.k.SetAddr(const_cast<void*>(k)));
+  check(p.v.SetAddr(const_cast<void*>(v)));
+  check(p.y.SetAddr(y));
+  p.scratch.cursor=0;
+  const int status = int(p.operation.RunFlash(s.handle,p.y,p.lse,p.q,p.k,p.v,p.mask,p.dropout,
+      [&](size_t n){return p.scratch.get(n);}));
+  if(status != 0) record_failure(status, "qwen38 muDNN SDPA");
+  return status;
+ } catch(const StatusError& e) {
+  record_failure(e.status, "qwen38 muDNN SDPA");
+  return e.status;
+ } catch(...) {
+  record_failure(kStatusUnknown, "qwen38 muDNN SDPA");
+  return kStatusUnknown;
  }
 }
 
