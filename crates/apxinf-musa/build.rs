@@ -98,6 +98,20 @@ const KERNEL_INPUT_TREES: &[KernelTree] = &[
         vendor_flags: false,
         only_with_vendor_fmha: &[],
     },
+    // The TileLang operator definitions. gen.py compiles them into the
+    // objects the tilelang section archives, so their bytes decide what the
+    // backend runs exactly as the assembly's do; not compiled here (the
+    // generator owns them) but hashed for the same reason as `kernels/asm`.
+    // `py` left the NON_CODE_EXTENSIONS denylist for this; the tree is not
+    // recursive so `generated/` outputs stay out of the id.
+    KernelTree {
+        path: "kernels/tilelang",
+        recursive: false,
+        compiled: &[],
+        includes: &[],
+        vendor_flags: false,
+        only_with_vendor_fmha: &[],
+    },
     // The vendored MATE/MUTLASS FMHA. Recursive, because the headers it
     // includes live four levels down and a frozen `.mu` that changed while the
     // build id did not would be indistinguishable from a current one.
@@ -243,7 +257,7 @@ fn hash_bytes(hash: &mut u128, bytes: &[u8]) {
 /// nothing else.
 const NON_CODE_EXTENSIONS: &[&str] = &[
     "md", "rst", "txt", "json", "toml", "ini", "cfg", "yaml", "yml", "csv", "log", "patch",
-    "diff", "py", "sh", "bash", "png", "jpg", "jpeg", "svg", "pdf",
+    "diff", "sh", "bash", "png", "jpg", "jpeg", "svg", "pdf", "gitignore",
 ];
 
 /// Whether a file can reach code generation, and so whether its bytes belong in
@@ -329,8 +343,10 @@ fn collect_kernel_inputs(root: &Path, files: &mut Vec<PathBuf>) {
 /// different kernels to share an id. `v3` narrows the rule a fourth time, to
 /// code-bearing files only (`reaches_codegen`); the visible `musa-kb2-` prefix
 /// moves with it so an id says which rule produced it without anyone having to
-/// reason about the hash.
-const KERNEL_BUILD_ID_DOMAIN: &str = "apxinf-musa-kernel-build-v3";
+/// reason about the hash. `v4` adds the TileLang operator definitions —
+/// generated objects now travel in the archive, so their sources belong in
+/// the id — and takes the visible prefix to `musa-kb3-`.
+const KERNEL_BUILD_ID_DOMAIN: &str = "apxinf-musa-kernel-build-v4";
 
 fn computed_kernel_build_id(
     root: &Path,
@@ -368,7 +384,7 @@ fn computed_kernel_build_id(
             hash_bytes(&mut hash, &contents);
         }
     }
-    format!("musa-kb2-{hash:032x}")
+    format!("musa-kb3-{hash:032x}")
 }
 
 /// Watch every input, explicitly.
@@ -433,6 +449,7 @@ fn main() {
     }
     println!("cargo:rustc-check-cfg=cfg(apxinf_musa_available)");
     println!("cargo:rustc-check-cfg=cfg(mttx_available)");
+    println!("cargo:rustc-check-cfg=cfg(tilelang_available)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_musa_mutlass_fmha)");
     emit_rerun_if_changed_tree(&manifest_dir);
 
@@ -550,6 +567,12 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let mutlass_fmha = vendor_fmha_available(&arch, &musa_path);
     emit_mubin_images(&musa_path, &arch, &manifest_dir, &out_dir);
+    let tilelang_objects = tilelang_kernels(
+        &manifest_dir,
+        &out_dir,
+        &mcc,
+        Some(arch.mcc_arch.as_str()),
+    );
     compile_kernels(
         &mcc,
         &include_dir,
@@ -557,6 +580,7 @@ fn main() {
         &manifest_dir,
         &out_dir,
         mutlass_fmha,
+        tilelang_objects,
     );
 
     // Keep the vendor math DSOs *after* the static archive. GNU ld's
@@ -706,6 +730,146 @@ fn vendor_fmha_available(arch: &musa_arch::MusaArch, musa_path: &Path) -> bool {
 /// see `VENDOR_FMHA_FLAGS`. `include_vendor_fmha` is the arch and toolkit gate:
 /// when it is false the tree is skipped, and `kernels/attention.rs` answers the
 /// operator with a named error instead of a link failure.
+/// Drive TileLang kernel generation and collect its linkable artifacts.
+///
+/// The `tilelang` cargo feature (default on) makes the TileLang toolchain a
+/// build requirement in the same sense the MUSA SDK is: present and working,
+/// or the build fails with an actionable message naming the escape hatch.
+/// With the feature off nothing TileLang-related runs, links or loads — the
+/// emitted table is empty and every GEMM stays on the native path.
+fn tilelang_kernels(
+    manifest_dir: &Path,
+    out_dir: &Path,
+    mcc: &Path,
+    mcc_arch: Option<&str>,
+) -> Vec<PathBuf> {
+    let table = out_dir.join("tilelang_kernels.rs");
+    let kernels = manifest_dir.join("kernels/tilelang");
+    let generated = out_dir.join("tilelang");
+    if std::env::var_os("CARGO_FEATURE_TILELANG").is_none() {
+        std::fs::write(
+            &table,
+            "// TileLang feature disabled at build time.\n             pub(super) static TILELANG_GEMMS: [super::tilelang::TilelangGemm; 0] = [];\n",
+        )
+        .expect("write the empty TileLang table");
+        println!("cargo:warning=ApxInf MUSA: built without TileLang kernels");
+        return Vec::new();
+    }
+    // Legacy artifacts are ignored by generation. Preserve them for upgrades;
+    // new outputs live outside the watched source tree in OUT_DIR.
+    for name in ["generated", "__pycache__"] {
+        if kernels.join(name).exists() {
+            println!("cargo:warning=ApxInf MUSA: ignoring legacy kernels/tilelang/{name}; new artifacts use OUT_DIR/tilelang");
+        }
+    }
+    // The toolchain is a requirement: a missing interpreter or a failed
+    // generation stops the build naming the fix, rather than silently
+    // producing a binary whose dispatch table expects absent symbols.
+    let python = std::env::var("APXINF_TILELANG_PYTHON")
+        .unwrap_or_else(|_| "python3".to_string());
+    let gen = manifest_dir.join("tools/tilelang/gen.py");
+    let mut command = std::process::Command::new(&python);
+    command.arg("-B").arg(&gen).arg("--out").arg(&generated);
+    if let Some(mcc_arch) = mcc_arch {
+        command.arg("--arch").arg(mcc_arch);
+    }
+    command.arg("--mcc").arg(mcc);
+    let status = command.status();
+    if !matches!(status, Ok(status) if status.success()) {
+        panic!(
+            "ApxInf MUSA: the `tilelang` feature is on but kernel generation \
+             failed (interpreter `{python}`). See the generator diagnostic above; \
+             point APXINF_TILELANG_PYTHON at its interpreter, or build with \
+             --no-default-features to exclude TileLang kernels entirely."
+        );
+    }
+    let inventory: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(generated.join("inventory.json"))
+            .expect("read the TileLang inventory"),
+    )
+    .expect("parse the TileLang inventory");
+    let artifacts = inventory["artifacts"]
+        .as_array()
+        .expect("inventory artifacts array");
+
+    let count = artifacts.len();
+    if count == 0 {
+        println!("cargo:warning=ApxInf MUSA: no TileLang operators linked for target {}; using native operators", mcc_arch.unwrap_or("unknown"));
+    } else {
+        println!("cargo:rustc-cfg=tilelang_available");
+    }
+    let mut objects = Vec::new();
+    let mut decls = String::new();
+    let mut rows = String::new();
+    for artifact in artifacts {
+        let shape = artifact["shape"].as_array().expect("inventory shape");
+        let status = match artifact["status"].as_str().unwrap_or("off") {
+            "enabled" => "TilelangStatus::Enabled",
+            "experimental" => "TilelangStatus::Experimental",
+            _ => "TilelangStatus::Off",
+        };
+        let entries = &artifact["entries"];
+        for role in ["part", "reduce"] {
+            let entry = entries[role].as_str().expect("inventory entry");
+            let file = artifact["files"][role].as_str().expect("inventory file");
+            objects.push(generated.join(file));
+            if role == "part" {
+                decls.push_str(&format!(
+                    "    pub(super) fn {entry}(a: *mut core::ffi::c_void, \
+                     b: *mut core::ffi::c_void, partials: *mut core::ffi::c_void, \
+                     stream: *mut core::ffi::c_void) -> i32;\n"
+                ));
+                decls.push_str(&format!(
+                    "    pub(super) fn {entry}_init() -> i32;\n"
+                ));
+            } else {
+                decls.push_str(&format!(
+                    "    pub(super) fn {entry}(partials: *mut core::ffi::c_void, \
+                     a_scale: *mut core::ffi::c_void, b_scale: *mut core::ffi::c_void, \
+                     out: *mut core::ffi::c_void, stream: *mut core::ffi::c_void) -> i32;\n"
+                ));
+                decls.push_str(&format!(
+                    "    pub(super) fn {entry}_init() -> i32;\n"
+                ));
+            }
+        }
+        let part = entries["part"].as_str().unwrap();
+        let reduce = entries["reduce"].as_str().unwrap();
+        rows.push_str(&format!(
+            "    TilelangGemm {{ m: {m}, n: {n}, k: {k}, status: {status}, \
+             scratch: {scratch}, part: {part}, part_init: {part}_init, \
+             reduce: {reduce}, reduce_init: {reduce}_init, \
+             part_ready: AtomicBool::new(false), \
+             reduce_ready: AtomicBool::new(false) }},\n",
+            m = shape[0], n = shape[1], k = shape[2],
+            scratch = artifact["scratch_bytes"].as_u64().unwrap_or(0),
+        ));
+    }
+    std::fs::write(
+        &table,
+        format!(
+            "// Generated by build.rs from the TileLang inventory. Do not edit.\n                          extern \"C\" {{\n{decls}}}\n\n             pub(super) static TILELANG_GEMMS: [TilelangGemm; {count}] = [\n{rows}];\n"
+        ),
+    )
+    .expect("write the TileLang table");
+    // Directory plus file-by-file, per this file's own rule that directory
+    // watching is not documented as recursive. `generated/` is deliberately
+    // absent: the generator rewrites the inventory on every run, and watching
+    // a build's own output would rerun it forever.
+    println!("cargo:rerun-if-changed={}", kernels.display());
+    if let Ok(entries) = std::fs::read_dir(&kernels) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                println!("cargo:rerun-if-changed={}", entry.path().display());
+            }
+        }
+    }
+    let generator = manifest_dir.join("tools/tilelang/gen.py");
+    println!("cargo:rerun-if-changed={}", generator.display());
+    println!("cargo:rerun-if-env-changed=APXINF_TILELANG_PYTHON");
+    objects
+}
+
 fn compile_kernels(
     mcc: &Path,
     include_dir: &Path,
@@ -713,6 +877,7 @@ fn compile_kernels(
     manifest_dir: &Path,
     out_dir: &Path,
     include_vendor_fmha: bool,
+    mut tilelang_objects: Vec<PathBuf>,
 ) {
     let mut sources = Vec::new();
     // The same trees the kernel-build-id hashes, so a source cannot be compiled
@@ -766,7 +931,9 @@ fn compile_kernels(
     }
     sources.sort_by(|left, right| left.1.cmp(&right.1));
 
-    if sources.is_empty() {
+    // TileLang objects are appended at the end; an empty native source set
+    // must not discard them on the way out.
+    if sources.is_empty() && tilelang_objects.is_empty() {
         println!("cargo:warning=ApxInf MUSA: no native kernels yet — all operators run through the eager bridge");
         return;
     }
@@ -852,6 +1019,11 @@ fn compile_kernels(
             }
         }
     }
+
+    // TileLang kernels arrive pre-compiled by `tilelang_kernels` above; they
+    // join the same static archive so the linked extension carries them exactly
+    // like the asm and MUSA-C objects.
+    objects.append(&mut tilelang_objects);
 
     let archive = out_dir.join("libapxinf_musa_kernels.a");
     // Start from nothing. `ar rcs` adds and replaces members but never removes
@@ -1005,5 +1177,5 @@ fn emit_mubin_images(
 }
 
 fn env_build_id() -> String {
-    std::env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| "musa-kb2-unknown".to_string())
+    std::env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| "musa-kb3-unknown".to_string())
 }

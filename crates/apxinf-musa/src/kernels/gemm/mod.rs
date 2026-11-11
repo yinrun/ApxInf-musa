@@ -20,6 +20,8 @@ mod qint8_tiles;
 mod bf16;
 pub(crate) mod assembly;
 mod w8a8;
+#[cfg(apxinf_musa_available)]
+mod tilelang;
 
 pub use assembly::{prepare_bf16_nn_weight, prepare_bf16_nt_weight};
 
@@ -39,6 +41,20 @@ pub use w8a8::{
     quantize_w8a8_silu_mul_activation, W8A8Activation, W8A8DecodeScope, W8A8Layout, W8A8ScaleMode,
     W8A8WeightView, SCALE_PAD as W8A8_SCALE_PAD,
 };
+
+/// Whether the compiled TileLang table serves a GEMM of these `(n, k)`
+/// dims at any decode batch. The INT8 weights' KN prepack keys on this; an
+/// empty table (the `tilelang` feature off, or no MUSA toolkit) always answers
+/// false, and `APXINF_TILELANG=off` answers false with it.
+#[cfg(apxinf_musa_available)]
+pub fn tilelang_serves_gemm(n: usize, k: usize) -> bool {
+    tilelang::serves_gemm(n, k)
+}
+
+#[cfg(not(apxinf_musa_available))]
+pub fn tilelang_serves_gemm(_n: usize, _k: usize) -> bool {
+    false
+}
 
 thread_local! {
     static DECODE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

@@ -27,7 +27,7 @@ pub(crate) mod gemm {
     pub(crate) use apxinf_musa::kernels::gemm::{
         adaptive_gate_residual_rms_quantize_w8a8_activation,
         adaptive_rms_quantize_w8a8_activation, decode_scope, norm_quantize_w8a8_activation,
-        prepare_bf16_nn_weight, prepare_bf16_nt_weight,
+        prepare_bf16_nn_weight, prepare_bf16_nt_weight, tilelang_serves_gemm,
     };
 }
 

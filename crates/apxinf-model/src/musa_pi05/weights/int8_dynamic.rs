@@ -359,11 +359,14 @@ mod linear {
                 .map(|value| value as u8)
                 .collect::<Vec<_>>();
             let weight_output_major = device_buffer(&bytes, backend)?;
-            let weight_decode_nn = if group == "action_mlp"
-                && linears.len() == 2
-                && scope.allows(group)
-                && ops::w8a8::tile_serves(output_dim, input_dim)
+            let weight_decode_nn = if scope.allows(group)
                 && ops::w8a8::decode_supported()
+                && ((group == "action_mlp"
+                    && linears.len() == 2
+                    && ops::w8a8::tile_serves(output_dim, input_dim))
+                    || crate::musa_pi05::backend::gemm::tilelang_serves_gemm(
+                        output_dim, input_dim,
+                    ))
             {
                 // A physical weight transformation, completed before warmup
                 // and capture. The quantized values and their FP16 scales are

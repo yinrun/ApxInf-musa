@@ -45,6 +45,13 @@ That wheel carries the backend without the MTTX range markers. Build with
 `--features musa-mttx` instead to link them; `apxinf_musa::MTTX_AVAILABLE` says
 which build a process got, and [profiling](pi05-mttx.md) covers the rest.
 
+The TileLang-generated operators are a default feature of the backend
+crate, but the wheel path opts in explicitly — `--features musa-tilelang` —
+because the model layer's `apxinf-musa` dependency turns the crate's own
+defaults off. Generation needs the TileLang toolchain; with the feature on
+and the toolchain missing, the build fails naming what to install instead of
+quietly shipping without the kernels.
+
 A device is `musa` or `musa:<index>` anywhere a device string is taken —
 `ModelRunner.load(..., device="musa:0")`, `--device`, the Python API. The CLI
 (`src/main.rs`) and the binding (`crates/apxinf-py/src/lib.rs`) parse it
@@ -272,6 +279,43 @@ upstream keeps for its INT32 accumulator and verifier.
 FP8 is **not ported**, and the port says so rather than silently degrading: an
 FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
 `fp8_static`.
+
+### TileLang operators
+
+Assembly, MUSA-C and the vendor libraries are the port's three standing
+operator sources; TileLang adds a fourth, generated. Where a tile-language
+description of a schedule beats every hand-written candidate, the kernel is
+written once in TileLang and the build compiles it into the same static
+library as the rest.
+
+`crates/apxinf-musa/kernels/tilelang/` holds the operator definitions — one
+Python module per family, each listing its shapes and compiling its kernels
+through the TileLang JIT. `tools/tilelang/gen.py`, driven from `build.rs`,
+builds every op, renames the generated entries to unique `kTl<N>_*` symbols,
+compiles them with `mcc` into relocatable objects, archives them into
+`libapxinf_musa_kernels.a`, and emits the `inventory.json` that becomes the
+compile-time table `TILELANG_GEMMS` — shape-exact, with a per-op status only
+`Enabled` entries dispatch from.
+
+The feature decides the build, and it fails loudly when it cannot deliver:
+`tilelang` is on by default for `apxinf-musa`, and a missing toolchain with
+it on is a hard error naming what to install; with the feature off nothing
+generates, the table is empty, and every GEMM keeps the standing routes.
+
+At run time `launch_quantized` consults the table before the assembly tiles.
+A served shape takes the TileLang route with its weight prepacked into the
+KN layout the split-K kernels read, and the loader makes exactly that
+decision from the same table; a served weight that nonetheless arrives
+without its KN pack stays on the native route with a one-time warning
+rather than failing the call. `APXINF_TILELANG=off` empties the route at run time — the
+feature-off semantics, no rebuild. The first dispatch prints one line
+(`TileLang route:` …), so a run's route adoption is visible in its log.
+
+The table today carries the two shapes where TileLang won on M1000, the
+action MLP down projection and the attention output (`10×1024×4096` and
+`10×1024×2048`). The fused INT8 graph route moves from 311.3 ms to 309.0 ms
+L1 (3 warm-up / 15 samples, equalization set) with the Orin-bundle cosine
+unchanged to the last digit (0.99936157).
 
 ## Serving on MUSA
 

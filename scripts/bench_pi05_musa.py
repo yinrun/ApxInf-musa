@@ -127,6 +127,7 @@ ENV_WATCH = (
     # equalization table, the load-time exclusion knob, and the two row-level
     # diagnostics (which read activations back and must stay off while timing).
     "APXINF_INT8_EQUALIZATION", "APXINF_INT8_DYNAMIC_EXCLUDE",
+    "APXINF_TILELANG",
     "APXINF_PI05_INT8_STATS", "APXINF_PI05_INT8_CHANNELS",
 )
 

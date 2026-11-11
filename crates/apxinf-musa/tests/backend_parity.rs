@@ -191,6 +191,20 @@ const KNOBS: &[Knob] = &[
                shape the tiles cannot serve is a configuration choice rather than a failure",
     },
     Knob {
+        name: "APXINF_MUSA_BF16_RMS",
+        counterpart: None,
+        note: "=scalar forces the fused affine-norm W8A8 producer onto its unfused \
+               scalar-RMS fallback - the fused kernel is the default and the knob \
+               is its debug escape hatch; the fusion is MUSA-specific, upstream \
+               CUDA has no counterpart path to steer",
+    },
+    Knob {
+        name: "APXINF_TILELANG",
+        counterpart: None,
+        note: "=off disables every linked TileLang GEMM for the run (auto is the default); \
+               the build-time `tilelang` feature decides whether any is linked at all",
+    },
+    Knob {
         name: "APXINF_PI05_INT8_STATS",
         counterpart: None,
         note: "record per-row activation levels for the equalization table. Reads \

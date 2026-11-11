@@ -742,6 +742,55 @@ fn launch_quantized(
     weight: W8A8WeightView<'_>,
     output: *mut c_void,
 ) -> Result<()> {
+    static TILELANG_ROUTE_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static TILELANG_KN_FALLBACK_LOGGED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    if let Some(entry) = super::tilelang::serves(plan.rows, plan.n, plan.k) {
+        if let Some(kn) = weight.decode_nn_values_i8.as_ref() {
+            let operation = "gemm::w8a8";
+            if !TILELANG_ROUTE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "MUSA {operation} TileLang route: {}x{}x{} (split-K scratch {} bytes)",
+                    entry.m,
+                    entry.n,
+                    entry.k,
+                    entry.scratch
+                );
+            }
+            let weight_bytes = plan
+                .n
+                .checked_mul(plan.k)
+                .ok_or_else(|| Error::Other(format!("MUSA {operation} weight size overflow")))?;
+            if kn.device() != ctx.device_id() || kn.len() != weight_bytes {
+                return Err(Error::Other(format!(
+                    "MUSA {operation} TileLang KN weight must be {weight_bytes} bytes on MUSA{}",
+                    ctx.device_id()
+                )));
+            }
+            return super::tilelang::launch(
+                ctx,
+                entry,
+                activation.quantized.ptr(),
+                kn.ptr(),
+                activation.row_scales.ptr(),
+                weight.scales_f16.ptr(),
+                output,
+            );
+        }
+        // A served shape whose weight arrived without the KN prepack: the
+        // loader and the dispatcher key on the same table, so this is a
+        // divergence to surface, not a call to fail — warn once, stay native.
+        if !TILELANG_KN_FALLBACK_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "MUSA gemm::w8a8: TileLang serves {}x{}x{} but the weight lacks the KN prepack; staying on the native route",
+                entry.m,
+                entry.n,
+                entry.k
+            );
+        }
+    }
     let operation = "gemm::w8a8";
     // A captured graph may only replay shapes the prepare traversal already
     // ran, and these tiles have no descriptor state of their own to prepare;

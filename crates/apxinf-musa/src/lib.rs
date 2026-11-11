@@ -65,6 +65,11 @@ pub const VENDOR_FMHA_BUILT: bool = cfg!(apxinf_musa_mutlass_fmha);
 /// before.
 pub const MTTX_AVAILABLE: bool = cfg!(mttx_available);
 
+/// Whether this build linked the TileLang-generated operators (the
+/// `tilelang` feature): the runtime counterpart of [`MTTX_AVAILABLE`], so a
+/// report can tell "not linked" from "linked but not served".
+pub const TILELANG_AVAILABLE: bool = cfg!(tilelang_available);
+
 /// The offload architecture this build targeted, e.g. `mp_22`.
 pub const MUSA_ARCH: &str = env!("APXINF_MUSA_ARCH");
 

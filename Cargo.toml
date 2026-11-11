@@ -42,6 +42,8 @@ hip = ["dep:apxinf-hip", "apxinf-model/hip"]
 # separate feature so a deployment that never profiles does not link them.
 musa = ["dep:apxinf-musa", "apxinf-model/musa"]
 musa-mttx = ["musa", "apxinf-musa/mttx"]
+# TileLang-generated operators (apxinf-musa's `tilelang` feature).
+musa-tilelang = ["musa", "apxinf-musa/tilelang"]
 # CPU-only BLAS backend for the non-GPU matmul fallback. Combine with `cuda`
 # if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
 # libopenblas — leave this off on Thor.

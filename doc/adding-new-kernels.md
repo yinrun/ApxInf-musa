@@ -8,6 +8,11 @@ Before starting, read the [`apxinf-cuda-new` architecture](../crates/apxinf-cuda
 
 Temporary probes, logs, and benchmark results must be placed in `devlocal/<feat-name>/` according to [`AGENTS.md`](../AGENTS.md), not mixed into production source directories.
 
+The MUSA backend's TileLang operator source — operators written in TileLang
+and compiled into the kernel archive at build time — has its own guide:
+[`tilelang-kernels.md`](tilelang-kernels.md). The procedure below covers the
+CUDA crate only.
+
 ## 0. Identify the Layer to Change First
 
 | What Changes | Layer | Main Directories |

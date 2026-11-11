@@ -26,3 +26,6 @@ target-p92i/
 
 /configs/tuning/**/*.recipe
 /configs/tuning/**/*.recipe.*.tmp
+
+# Local Cargo build directory
+/target-new/

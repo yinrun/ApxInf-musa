@@ -6,9 +6,16 @@ license = "Apache-2.0"
 build = "build.rs"
 
 [features]
-default = ["mttx"]
+default = ["mttx", "tilelang"]
 # Range markers for msys profiling, backed by MTTX. Mirrors `apxinf-cuda/nvtx`.
 mttx = []
+# TileLang-generated kernels as a build requirement (doc/tilelang-kernels.md):
+# on, the build drives tools/tilelang/gen.py and links the artifacts into the
+# kernel archive; off, neither the build nor the binary touches TileLang.
+tilelang = []
+
+[build-dependencies]
+serde_json = "1"
 
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }

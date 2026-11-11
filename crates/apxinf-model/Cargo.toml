@@ -38,6 +38,9 @@ hip = ["dep:apxinf-hip"]
 # `musa` enables the backend; `musa-mttx` adds its profiling markers.
 musa = ["dep:apxinf-musa"]
 musa-mttx = ["musa", "apxinf-musa/mttx"]
+# `musa-tilelang` additionally links the TileLang-generated operators; their
+# generation runs in apxinf-musa's build.rs and needs the TileLang toolchain.
+musa-tilelang = ["musa", "apxinf-musa/tilelang"]
 
 [[example]]
 name = "pi05_bench"
