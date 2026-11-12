@@ -20,6 +20,8 @@ pub mod metal_minicpm5;
 pub mod metal_qwen3;
 #[cfg(feature = "musa")]
 pub mod musa_pi05;
+#[cfg(feature = "musa")]
+pub mod musa_qwen38;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;

@@ -24,6 +24,10 @@ pub fn register_builtin_models() {
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
     registry::register("qwen_drive", load_qwen_drive);
+    #[cfg(feature = "musa")]
+    registry::register("qwen3_5", load_qwen38_musa);
+    #[cfg(feature = "musa")]
+    registry::register("qwen3_5_text", load_qwen38_musa);
     #[cfg(feature = "cuda")]
     registry::register("qwen38", load_qwen38);
     #[cfg(feature = "cuda")]
@@ -116,6 +120,16 @@ fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
         *tensor = Tensor::from_f32(shape, &tensor.to_f32_vec()?)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "musa")]
+fn load_qwen38_musa(
+    path: &Path,
+    device: Device,
+    backend: Arc<dyn Backend>,
+    options: &LoadOptions,
+) -> Result<LoadedModel> {
+    crate::musa_qwen38::load_registered(path, device, backend, options)
 }
 
 /// Qwen3.8-27B-NVFP4 on CUDA: safetensors shards in the checkpoint directory,
