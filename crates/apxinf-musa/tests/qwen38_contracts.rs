@@ -419,3 +419,110 @@ fn rope_with_equal_triples_is_plain_partial_rope() {
         }
     }
 }
+
+// Zero Q/K make softmax uniform. Distinct V values per token/head expose
+// incorrect causal masking, GQA head mapping, and batch-first strides.
+fn sdpa_uniform_case(q_len: usize, k_len: usize, causal: bool) {
+    let ctx = MusaContext::new(0).unwrap();
+    let (_, q) = upload_bf16(&ctx, &vec![0.; q_len * 24 * 256], vec![1,q_len,24,256]);
+    let (_, k) = upload_bf16(&ctx, &vec![0.; k_len * 4 * 256], vec![1,k_len,4,256]);
+    let values: Vec<f32> = (0..k_len*4*256).map(|i| {
+        let t = i / (4*256); let h = (i/256)%4;
+        (t + 2*h) as f32 / 16.
+    }).collect();
+    let (_, v) = upload_bf16(&ctx, &values, vec![1,k_len,4,256]);
+    let (buffer, mut out) = upload_bf16(&ctx, &vec![-99.; q_len*24*256], vec![1,q_len,24,256]);
+    // Repeat with the same shape to exercise cached descriptors and scratch.
+    for _ in 0..2 {
+        qwen38::sdpa_bf16(&ctx,&q,&k,&v,&mut out,causal).unwrap();
+        ctx.synchronize().unwrap();
+        for (i, got) in read_bf16(&buffer).iter().enumerate() {
+            let t=i/(24*256); let h=(i/256)%24;
+            let count=if causal {t+1} else {k_len};
+            let want=((count-1) as f32/2. + 2.*(h/6) as f32)/16.;
+            assert!(got.is_finite() && (got-want).abs()<0.016,
+                "SDPA t={t} h={h}: {got} != {want}");
+        }
+    }
+}
+
+#[test]
+fn sdpa_causal_prefill_uses_only_prefix_and_shares_kv_heads() {
+    sdpa_uniform_case(16,16,true);
+}
+
+#[test]
+fn sdpa_decode_reads_entire_valid_cache() {
+    sdpa_uniform_case(1,32,false);
+}
+
+#[test]
+fn sdpa_rejects_empty_sequence_before_vendor_dispatch() {
+    let ctx = MusaContext::new(0).unwrap();
+    let q = Tensor::zeros(vec![1,0,24,256], DType::BF16);
+    let k = Tensor::zeros(vec![1,0,4,256], DType::BF16);
+    let mut out = Tensor::zeros(vec![1,0,24,256], DType::BF16);
+    let error=qwen38::sdpa_bf16(&ctx,&q,&k,&k,&mut out,true).unwrap_err();
+    assert!(error.to_string().contains("non-empty"), "wrong validation boundary: {error}");
+}
+
+#[test]
+fn sdpa_random_nonzero_matches_f64_softmax() {
+    let ctx=MusaContext::new(0).unwrap();
+    for (batch,ql,kl,causal) in [(1,17,17,true),(2,1,33,false),(1,1,129,false)] {
+        let mut seed=713u64;
+        let mut random=|n:usize| -> Vec<f32> {(0..n).map(|_| {
+            seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            bf16_from_bits(bf16_bits(((seed>>32) as u32 as f64/u32::MAX as f64*2.-1.) as f32))
+        }).collect()};
+        let qv=random(batch*ql*24*256); let kv=random(batch*kl*4*256); let vv=random(batch*kl*4*256);
+        let (_,q)=upload_bf16(&ctx,&qv,vec![batch,ql,24,256]);
+        let (_,k)=upload_bf16(&ctx,&kv,vec![batch,kl,4,256]);
+        let (_,v)=upload_bf16(&ctx,&vv,vec![batch,kl,4,256]);
+        let (ob,mut out)=upload_bf16(&ctx,&vec![0.;qv.len()],vec![batch,ql,24,256]);
+        qwen38::sdpa_bf16(&ctx,&q,&k,&v,&mut out,causal).unwrap();ctx.synchronize().unwrap();
+        let got=read_bf16(&ob);let(mut err,mut norm)=(0f64,0f64);
+        for b in 0..batch {for t in 0..ql {for h in 0..24 {
+            let count=if causal {t+1}else{kl};
+            let qi=((b*ql+t)*24+h)*256;
+            let mut scores:Vec<f64>=(0..count).map(|j| {
+                let ki=((b*kl+j)*4+h/6)*256;
+                (0..256).map(|d|qv[qi+d] as f64*kv[ki+d] as f64).sum::<f64>()/16.
+            }).collect();
+            let max=scores.iter().copied().fold(f64::NEG_INFINITY,f64::max);
+            for s in &mut scores {*s=(*s-max).exp();}
+            let denom=scores.iter().sum::<f64>();
+            for d in 0..256 {
+                let want=(0..count).map(|j|scores[j]*vv[((b*kl+j)*4+h/6)*256+d] as f64).sum::<f64>()/denom;
+                assert!(got[qi+d].is_finite());err+=(got[qi+d] as f64-want).powi(2);norm+=want*want;
+            }
+        }}}
+        let rel=(err/norm).sqrt();println!("SDPA batch={batch} q={ql} k={kl} rel_l2={rel}");assert!(rel<0.008);
+    }
+}
+
+#[test]
+fn sdpa_rejects_invalid_geometry_dtype_and_causal_lengths() {
+    let ctx=MusaContext::new(0).unwrap();
+    let (_,q)=upload_bf16(&ctx,&vec![0.;24*256],vec![1,1,24,256]);
+    let (_,k)=upload_bf16(&ctx,&vec![0.;2*4*256],vec![1,2,4,256]);
+    let (_,mut out)=upload_bf16(&ctx,&vec![0.;24*256],vec![1,1,24,256]);
+    assert!(qwen38::sdpa_bf16(&ctx,&q,&k,&k,&mut out,true).is_err());
+    let (_,bad)=upload_f32(&ctx,&vec![0.;24*256],vec![1,1,24,256]);
+    assert!(qwen38::sdpa_bf16(&ctx,&bad,&k,&k,&mut out,false).is_err());
+    let (_,bad)=upload_bf16(&ctx,&vec![0.;2*5*256],vec![1,2,5,256]);
+    assert!(qwen38::sdpa_bf16(&ctx,&q,&bad,&bad,&mut out,false).is_err());
+    let cpu=Tensor::zeros(vec![1,1,24,256],DType::BF16);
+    assert!(qwen38::sdpa_bf16(&ctx,&cpu,&k,&k,&mut out,false).is_err());
+}
+
+#[test]
+fn sdpa_rejects_other_device_before_dispatch() {
+    let ctx=MusaContext::new(0).unwrap();
+    let other=MusaContext::new(1).unwrap();
+    let (_,q)=upload_bf16(&other,&vec![0.;24*256],vec![1,1,24,256]);
+    let (_,k)=upload_bf16(&ctx,&vec![0.;4*256],vec![1,1,4,256]);
+    let (_,mut out)=upload_bf16(&ctx,&vec![0.;24*256],vec![1,1,24,256]);
+    let result=qwen38::sdpa_bf16(&ctx,&q,&k,&k,&mut out,false);
+    assert!(result.is_err(), "cross-device operand reached vendor dispatch");
+}

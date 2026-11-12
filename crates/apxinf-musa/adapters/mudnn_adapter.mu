@@ -95,6 +95,38 @@ struct Matmul {
     check(operation.SetDeterministic(true));
   }
 };
+struct Flash {
+  md::Tensor q,k,v,y,lse,mask,dropout;
+  md::ScaledDotProductAttention operation;
+  Scratch scratch;
+  void* lse_buffer = nullptr;
+  Flash(int batch,int heads,int tokens,int dim,musaStream_t stream) : scratch(stream) {
+    for(auto p:{&q,&k,&v,&y,&mask}) check(p->SetType(md::Tensor::Type::BFLOAT16));
+    for(auto p:{&q,&k,&v,&y}) check(p->SetNdInfo({batch,heads,tokens,dim},
+      {tokens*heads*dim,dim,heads*dim,1}));
+    check(lse.SetType(md::Tensor::Type::FLOAT)); check(lse.SetNdInfo({batch,heads,tokens}));
+    check(mask.SetNdInfo({0}));
+    check(dropout.SetType(md::Tensor::Type::FLOAT)); check(dropout.SetNdInfo({0}));
+    check(operation.SetBatchSize(batch)); check(operation.SetHeadsNum(heads));
+    check(operation.SetEmbedDim(heads*dim)); check(operation.SetScale(1./std::sqrt(double(dim))));
+    check(operation.SetCausal(false)); check(operation.SetMaskMode(false));
+    check(operation.SetTraining(false)); check(operation.SetDropoutP(0));
+    // Pinned, like Matmul above and for the same reason: a captured graph is
+    // only worth capturing if replaying it twice gives one answer twice. The
+    // vendor default is not documented as reproducible, and one run of this
+    // binary against a fixed fixture has disagreed with three others at the
+    // sixth significant digit of the end-to-end cosine with no input differing.
+    check(operation.SetIsDeterministic(true));
+    // Last, so no later `check` can throw past an owned allocation. A throwing
+    // constructor does not run `~Flash` (only the members'), and a rejected
+    // shape re-runs the constructor on every call -- `make_unique` never
+    // inserts it -- so a leak here would repeat rather than happen once.
+    if(musaMalloc(&lse_buffer,size_t(batch)*heads*tokens*sizeof(float))!=musaSuccess)
+      throw StatusError{kStatusAllocationFailed};
+    check(lse.SetAddr(lse_buffer));
+  }
+  ~Flash() { if(lse_buffer) musaFree(lse_buffer); }
+};
 // qwen38 SDPA uses its own shape-keyed descriptor cache. The qwen38 model
 // supplies batch-first logical tensors with the physical strides required by
 // mudnn: [batch, heads, seq, dim] descriptor, memory ordered [batch, seq,

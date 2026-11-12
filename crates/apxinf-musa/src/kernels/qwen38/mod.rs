@@ -9,6 +9,9 @@
 //! Sequence-tensor contracts are BATCH-FIRST `[tokens, ...]` rows — see the
 //! module comment in the device file for why this is pinned in writing.
 
+mod sequence;
+pub use sequence::gdn_causal_conv_prefill;
+
 use apxinf_core::{Error, Result, Tensor};
 
 #[cfg(apxinf_musa_available)]
@@ -402,6 +405,9 @@ pub fn sdpa_bf16(
     let heads = qd[2];
     let dim = qd[3];
     let (k_batch, k_tokens, kv_heads, k_dim) = (kd[0], kd[1], kd[2], kd[3]);
+    if batch == 0 || q_tokens == 0 || k_tokens == 0 {
+        return Err(Error::Other("qwen38 sdpa: batch and sequences must be non-empty".into()));
+    }
     if dim != 256 || k_dim != 256 || batch != k_batch || heads == 0 || kv_heads == 0
         || heads % kv_heads != 0
     {
@@ -414,12 +420,15 @@ pub fn sdpa_bf16(
             "qwen38 sdpa: causal mode requires q_tokens == k_tokens; decode is non-causal".into(),
         ));
     }
+    for (name, tensor) in [("q", q), ("k", k), ("v", v), ("out", &*out)] {
+        super::contracts::require_device(ctx, tensor, "qwen38 sdpa", name)?;
+    }
     require_shape(q, DType::BF16, &qd, "qwen38 sdpa", "q")?;
     require_shape(k, DType::BF16, &kd, "qwen38 sdpa", "k")?;
     require_shape(v, DType::BF16, &kd, "qwen38 sdpa", "v")?;
     require_shape(out, DType::BF16, &[batch, q_tokens, heads, dim], "qwen38 sdpa", "out")?;
     unsafe {
-        crate::ffi::check_mudnn(
+        ffi::custom::check_mudnn(
             ffi::custom::apxinf_musa_qwen38_mudnn_sdpa_bf16(
                 tensor_ptr(q)?,
                 tensor_ptr(k)?,
@@ -434,11 +443,13 @@ pub fn sdpa_bf16(
                 i32::from(causal),
                 ctx.stream().handle(),
             ),
-            "qwen38 sdpa",
-        )
+            || "qwen38 sdpa".to_string(),
+        ).map_err(crate::error::musa_error)
     }
 }
 
+/// Apply partial half-split mRoPE with interleaved position axes.
+pub fn rope(
     ctx: &MusaContext,
     data: &mut Tensor,
     positions: &Tensor,

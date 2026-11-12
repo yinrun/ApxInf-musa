@@ -14,6 +14,8 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    /// Thread-local diagnostic for a failed muDNN call.
+    pub fn apxinf_musa_mudnn_last_error() -> *const std::os::raw::c_char;
     pub fn apxinf_musa_capture_anchor(stream: *mut c_void) -> musaError_t;
     pub fn apxinf_musa_mublas_release_stream(stream: *mut c_void);
     pub fn apxinf_musa_mudnn_release_stream(stream: *mut c_void);
