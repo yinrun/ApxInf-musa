@@ -14,12 +14,14 @@ pub const KV_HEADS: usize = 4;
 pub const HEAD_DIM: usize = 256;
 pub const GDN_QKV: usize = 10_240;
 pub const GDN_Z: usize = 6_144;
+pub const GDN_V_HEADS: usize = 48;
+pub const GDN_HEAD_DIM: usize = 128;
 pub const GDN_A_B: usize = 48;
 pub const GDN_CONV: usize = 4;
 pub const RMS_EPS: f32 = 1e-6;
 pub const ROPE_THETA: f32 = 10_000_000.0;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Qwen38Config {
     pub text: ModelConfig,
     pub full_attention_interval: usize,

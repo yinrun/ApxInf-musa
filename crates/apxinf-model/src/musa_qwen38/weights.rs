@@ -25,22 +25,24 @@ fn transpose_bf16(t: &Tensor) -> Result<Tensor> {
 }
 fn expected(name: &str) -> Option<Vec<usize>> {
     if name.ends_with("embed_tokens.weight") || name.ends_with("lm_head.weight") { Some(vec![VOCAB, HIDDEN]) }
-    else if name.ends_with("input_layernorm.weight") || name.ends_with("post_attention_layernorm.weight") || name.ends_with("norm.weight") { Some(vec![HIDDEN]) }
+    else if name.ends_with("linear_attn.in_proj_qkv.weight") { Some(vec![GDN_QKV, HIDDEN]) }
+    else if name.ends_with("linear_attn.in_proj_z.weight") { Some(vec![GDN_Z, HIDDEN]) }
+    else if name.ends_with("linear_attn.out_proj.weight") { Some(vec![HIDDEN, GDN_Z]) }
+    else if name.ends_with("linear_attn.in_proj_a.weight") || name.ends_with("linear_attn.in_proj_b.weight") { Some(vec![GDN_A_B, HIDDEN]) }
+    else if name.ends_with("linear_attn.conv1d.weight") { Some(vec![GDN_QKV, 1, GDN_CONV]) }
+    else if name.ends_with("linear_attn.dt_bias") || name.ends_with("linear_attn.A_log") { Some(vec![GDN_V_HEADS]) }
+    else if name.ends_with("linear_attn.norm.weight") { Some(vec![GDN_HEAD_DIM]) }
+    else if name.ends_with("self_attn.q_norm.weight") || name.ends_with("self_attn.k_norm.weight") { Some(vec![HEAD_DIM]) }
+    else if name.ends_with("input_layernorm.weight") || name.ends_with("post_attention_layernorm.weight") || name == "norm.weight" { Some(vec![HIDDEN]) }
     else if name.contains("gate_proj.weight") || name.contains("up_proj.weight") { Some(vec![INTERMEDIATE, HIDDEN]) }
     else if name.contains("down_proj.weight") { Some(vec![HIDDEN, INTERMEDIATE]) }
     else if name.contains("q_proj.weight") { Some(vec![HEADS * HEAD_DIM, HIDDEN]) }
     else if name.contains("k_proj.weight") { Some(vec![KV_HEADS * HEAD_DIM, HIDDEN]) }
     else if name.contains("v_proj.weight") { Some(vec![KV_HEADS * HEAD_DIM, HIDDEN]) }
     else if name.contains("o_proj.weight") { Some(vec![HIDDEN, HEADS * HEAD_DIM]) }
-    else if name.ends_with("linear_attn.in_proj_qkv") { Some(vec![GDN_QKV, HIDDEN]) }
-    else if name.ends_with("linear_attn.in_proj_z") { Some(vec![GDN_Z, HIDDEN]) }
-    else if name.ends_with("linear_attn.out_proj") { Some(vec![HIDDEN, GDN_Z]) }
-    else if name.ends_with("linear_attn.in_proj_a.weight") || name.ends_with("linear_attn.in_proj_b.weight") { Some(vec![GDN_A_B, HIDDEN]) }
-    else if name.ends_with("linear_attn.conv1d.weight") { Some(vec![GDN_QKV, 1, GDN_CONV]) }
-    else if name.ends_with("linear_attn.dt_bias") || name.ends_with("linear_attn.A_log") { Some(vec![GDN_V_HEADS]) }
-    else if name.ends_with("linear_attn.norm.weight") { Some(vec![GDN_HEAD_DIM]) }
     else { None }
 }
+
 fn is_gemm(name: &str) -> bool { name.ends_with(".weight") && !name.ends_with("embed_tokens.weight") && !name.ends_with("lm_head.weight") && !name.ends_with("norm.weight") && !name.ends_with("layernorm.weight") && !name.ends_with("conv1d.weight") }
 
 pub fn from_hf_map(input: HashMap<String, Tensor>) -> Result<Qwen38Weights> {
