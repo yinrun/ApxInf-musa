@@ -36,7 +36,7 @@ fn expected(name: &str) -> Option<Vec<usize>> {
     else if name.ends_with("input_layernorm.weight") || name.ends_with("post_attention_layernorm.weight") || name == "norm.weight" { Some(vec![HIDDEN]) }
     else if name.contains("gate_proj.weight") || name.contains("up_proj.weight") { Some(vec![INTERMEDIATE, HIDDEN]) }
     else if name.contains("down_proj.weight") { Some(vec![HIDDEN, INTERMEDIATE]) }
-    else if name.contains("q_proj.weight") { Some(vec![HEADS * HEAD_DIM, HIDDEN]) }
+    else if name.contains("q_proj.weight") { Some(vec![2 * HEADS * HEAD_DIM, HIDDEN]) }
     else if name.contains("k_proj.weight") { Some(vec![KV_HEADS * HEAD_DIM, HIDDEN]) }
     else if name.contains("v_proj.weight") { Some(vec![KV_HEADS * HEAD_DIM, HIDDEN]) }
     else if name.contains("o_proj.weight") { Some(vec![HIDDEN, HEADS * HEAD_DIM]) }
@@ -81,7 +81,7 @@ mod tests {
  use super::*;
  fn t(shape: Vec<usize>) -> Tensor { Tensor::from_bf16(shape.clone(), &vec![bf16::from_f32(0.0); shape.iter().product()]).unwrap() }
  #[test] fn maps_representative_hf_names_and_transposes() {
-  let mut m=HashMap::new(); m.insert("model.language_model.embed_tokens.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("lm_head.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("model.language_model.layers.0.mlp.gate_proj.weight".into(),t(vec![INTERMEDIATE,HIDDEN])); m.insert("model.visual.patch_embed.proj.weight".into(),t(vec![1])); m.insert("model.mtp.layers.0.weight".into(),t(vec![1]));
-  let w=from_hf_map(m).unwrap(); assert_eq!(w.layers[0].gdn.as_ref().unwrap().tensors["mlp.gate_proj.weight"].tensor.shape().dims(), &[HIDDEN,INTERMEDIATE]); assert!(w.root.contains_key("embed_tokens.weight")); assert_eq!(w.root["lm_head.weight"].tensor.shape().dims(), &[HIDDEN,VOCAB]);
+  let mut m=HashMap::new(); m.insert("model.language_model.embed_tokens.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("lm_head.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("model.language_model.layers.0.mlp.gate_proj.weight".into(),t(vec![INTERMEDIATE,HIDDEN])); m.insert("model.language_model.layers.3.self_attn.q_proj.weight".into(),t(vec![2*HEADS*HEAD_DIM,HIDDEN])); m.insert("model.visual.patch_embed.proj.weight".into(),t(vec![1])); m.insert("model.mtp.layers.0.weight".into(),t(vec![1]));
+  let w=from_hf_map(m).unwrap(); assert_eq!(w.layers[0].gdn.as_ref().unwrap().tensors["mlp.gate_proj.weight"].tensor.shape().dims(), &[HIDDEN,INTERMEDIATE]); assert!(w.root.contains_key("embed_tokens.weight")); assert_eq!(w.root["lm_head.weight"].tensor.shape().dims(), &[HIDDEN,VOCAB]); assert_eq!(w.layers[3].attention.as_ref().unwrap().tensors["self_attn.q_proj.weight"].tensor.shape().dims(), &[HIDDEN,2*HEADS*HEAD_DIM]);
  }
 }
