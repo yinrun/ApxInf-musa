@@ -49,7 +49,11 @@ pub fn from_hf_map(input: HashMap<String, Tensor>) -> Result<Qwen38Weights> {
     let mut root = HashMap::new(); let mut layers: Vec<Qwen38Layer> = (0..LAYERS).map(|_| Qwen38Layer { gdn: None, attention: None, tensors: HashMap::new() }).collect();
     for (name, tensor) in input {
         if name.starts_with("model.visual.") || name.starts_with("model.mtp.") || name.starts_with("visual.") || name.starts_with("mtp.") { continue; }
-        let short = name.strip_prefix("model.language_model.").ok_or_else(|| Error::Other(format!("unsupported Qwen3.8 tensor prefix: {name}")))?;
+        let short = if name == "lm_head.weight" {
+            name.as_str()
+        } else {
+            name.strip_prefix("model.language_model.").ok_or_else(|| Error::Other(format!("unsupported Qwen3.8 tensor prefix: {name}")))?
+        };
         let shape = tensor.shape().dims().to_vec();
         if let Some(rest) = short.strip_prefix("layers.") {
             let (idx, rest) = rest.split_once('.').ok_or_else(|| Error::Other(format!("bad layer tensor name {name}")))?;
@@ -64,6 +68,7 @@ pub fn from_hf_map(input: HashMap<String, Tensor>) -> Result<Qwen38Weights> {
             if let Some(want) = expected(short) { if shape != want { return Err(Error::Other(format!("{name} shape {shape:?}, expected {want:?}"))); } }
             else { return Err(Error::Other(format!("unsupported Qwen3.8 root tensor {name}"))); }
             if tensor.dtype()!=DType::BF16 { return Err(Error::Other(format!("{name} is {:?}, expected BF16", tensor.dtype()))); }
+            let tensor = if short == "lm_head.weight" { transpose_bf16(&tensor)? } else { tensor };
             root.insert(short.to_string(), PlainBf16 { tensor });
         }
     }
@@ -76,7 +81,7 @@ mod tests {
  use super::*;
  fn t(shape: Vec<usize>) -> Tensor { Tensor::from_bf16(shape.clone(), &vec![bf16::from_f32(0.0); shape.iter().product()]).unwrap() }
  #[test] fn maps_representative_hf_names_and_transposes() {
-  let mut m=HashMap::new(); m.insert("model.language_model.embed_tokens.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("model.language_model.layers.0.mlp.gate_proj.weight".into(),t(vec![INTERMEDIATE,HIDDEN])); m.insert("model.visual.patch_embed.proj.weight".into(),t(vec![1])); m.insert("model.mtp.layers.0.weight".into(),t(vec![1]));
-  let w=from_hf_map(m).unwrap(); assert_eq!(w.layers[0].gdn.as_ref().unwrap().tensors["mlp.gate_proj.weight"].tensor.shape().dims(), &[HIDDEN,INTERMEDIATE]); assert!(w.root.contains_key("embed_tokens.weight"));
+  let mut m=HashMap::new(); m.insert("model.language_model.embed_tokens.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("lm_head.weight".into(),t(vec![VOCAB,HIDDEN])); m.insert("model.language_model.layers.0.mlp.gate_proj.weight".into(),t(vec![INTERMEDIATE,HIDDEN])); m.insert("model.visual.patch_embed.proj.weight".into(),t(vec![1])); m.insert("model.mtp.layers.0.weight".into(),t(vec![1]));
+  let w=from_hf_map(m).unwrap(); assert_eq!(w.layers[0].gdn.as_ref().unwrap().tensors["mlp.gate_proj.weight"].tensor.shape().dims(), &[HIDDEN,INTERMEDIATE]); assert!(w.root.contains_key("embed_tokens.weight")); assert_eq!(w.root["lm_head.weight"].tensor.shape().dims(), &[HIDDEN,VOCAB]);
  }
 }
