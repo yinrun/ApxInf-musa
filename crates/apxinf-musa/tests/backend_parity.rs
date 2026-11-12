@@ -272,10 +272,12 @@ fn read_names(source_dir: &str) -> BTreeSet<String> {
 fn backend_knobs() -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
     let mut cuda = read_names("crates/apxinf-cuda-new/src");
     cuda.extend(read_names("crates/apxinf-cuda-new/native"));
+    let mut model = read_names("crates/apxinf-model/src/musa_pi05");
+    model.extend(read_names("crates/apxinf-model/src/musa_qwen38"));
     (
         cuda,
         read_names("crates/apxinf-musa/src"),
-        read_names("crates/apxinf-model/src/musa_pi05"),
+        model,
     )
 }
 

@@ -1068,3 +1068,17 @@ extern "C" musaError_t apxinf_musa_qwen38_rope(
       heads, head_dim, rotary_dim, theta, section_h, section_w);
   return musaGetLastError();
 }
+
+extern "C" musaError_t apxinf_musa_qwen38_offset_rms(const void* x,const void* w,
+ void* out,int rows,int cols,float eps,musaStream_t stream) {
+ if(!x||!w||!out||rows<=0||cols<=0||!std::isfinite(eps)||eps<=0) return musaErrorInvalidValue;
+ qwen38_offset_rms_kernel<<<rows,256,0,stream>>>(static_cast<const __mt_bfloat16*>(x),static_cast<const __mt_bfloat16*>(w),static_cast<__mt_bfloat16*>(out),cols,eps);
+ return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_qwen38_gated_rms(const void* x,const void* w,
+ const void* z,void* out,int rows,int cols,float eps,musaStream_t stream) {
+ if(!x||!w||!z||!out||rows<=0||cols<=0||!std::isfinite(eps)||eps<=0) return musaErrorInvalidValue;
+ qwen38_gated_rms_kernel<<<rows,256,0,stream>>>(static_cast<const __mt_bfloat16*>(x),static_cast<const __mt_bfloat16*>(w),static_cast<const __mt_bfloat16*>(z),static_cast<__mt_bfloat16*>(out),cols,eps);
+ return musaGetLastError();
+}

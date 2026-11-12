@@ -172,8 +172,19 @@ struct Qwen38Sdpa {
   }
   ~Qwen38Sdpa() { if (lse_buffer) musaFree(lse_buffer); }
 };
+struct SwiGluPlan {
+  md::Tensor input, output;
+  md::SwiGlu operation;
+  SwiGluPlan(int rows, int cols) {
+    check(input.SetType(md::Tensor::Type::BFLOAT16));
+    check(output.SetType(md::Tensor::Type::BFLOAT16));
+    check(input.SetNdInfo({rows, 2 * cols}));
+    check(output.SetNdInfo({rows, cols}));
+  }
+};
 struct Stream {
   md::Handle handle;
+  std::map<std::pair<int,int>,std::unique_ptr<SwiGluPlan>> swiglus;
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
   std::map<std::tuple<int,int,int,int,int,bool>,std::unique_ptr<Qwen38Sdpa>> qwen38_sdpa;
@@ -349,5 +360,29 @@ extern "C" void apxinf_musa_mudnn_release_stream(musaStream_t stream) {
    apxinf_adapters::select_device(it->first.first);
    it=streams.erase(it);
   } else ++it;
+ }
+}
+
+extern "C" int apxinf_musa_qwen38_swiglu_bf16(const void* input, void* output,
+ int rows, int cols, musaStream_t stream) {
+ try {
+  if (!input || !output || rows <= 0 || cols <= 0 || cols > 1073741823)
+    throw StatusError{kStatusInvalidArgument};
+  auto& s = state(stream);
+  auto key = std::make_pair(rows, cols);
+  auto it = s.swiglus.find(key);
+  if (it == s.swiglus.end()) {
+    if (capturing(stream)) throw StatusError{kStatusCaptureInProgress};
+    it = s.swiglus.emplace(key, std::make_unique<SwiGluPlan>(rows,cols)).first;
+  }
+  auto& p = *it->second;
+  check(p.input.SetAddr(const_cast<void*>(input)));
+  check(p.output.SetAddr(output));
+  check(p.operation.Run(s.handle,p.output,p.input));
+  return 0;
+ } catch (const StatusError& e) {
+  record_failure(e.status,"qwen38 muDNN SwiGLU"); return e.status;
+ } catch (...) {
+  record_failure(kStatusUnknown,"qwen38 muDNN SwiGLU"); return kStatusUnknown;
  }
 }

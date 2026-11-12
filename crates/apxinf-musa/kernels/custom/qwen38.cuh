@@ -233,3 +233,35 @@ __global__ void qwen38_rope_kernel(__mt_bfloat16* data, const int* positions,
   row[pair] = __float2bfloat16(low * ca - high * sa);
   row[pair + half] = __float2bfloat16(high * ca + low * sa);
 }
+
+// HF Qwen RMSNorm: form (1 + raw offset) in F32, round only final output.
+__global__ void qwen38_offset_rms_kernel(const __mt_bfloat16* x,
+ const __mt_bfloat16* weight, __mt_bfloat16* out, int cols, float eps) {
+ __shared__ float partial[256];
+ __shared__ float inverse;
+ const int row=blockIdx.x;
+ float sum=0.f;
+ for(int c=threadIdx.x;c<cols;c+=blockDim.x){float v=__bfloat162float(x[(size_t)row*cols+c]);sum+=v*v;}
+ partial[threadIdx.x]=sum;__syncthreads();
+ if(threadIdx.x==0){float total=0;for(int i=0;i<blockDim.x;i++)total+=partial[i];inverse=rsqrtf(total/cols+eps);}
+ __syncthreads();
+ for(int c=threadIdx.x;c<cols;c+=blockDim.x){size_t i=(size_t)row*cols+c;out[i]=__float2bfloat16(__bfloat162float(x[i])*inverse*(1.f+__bfloat162float(weight[c])));}
+}
+
+// HF eager gated RMSNorm cast points: norm -> BF16, weight product ->
+// BF16, multiply by F32 SiLU(z), final BF16 output.
+__global__ void qwen38_gated_rms_kernel(const __mt_bfloat16* x,
+ const __mt_bfloat16* w,const __mt_bfloat16* z,__mt_bfloat16* out,int cols,float eps) {
+ __shared__ float partial[256]; __shared__ float inverse;
+ size_t base=(size_t)blockIdx.x*cols;float sum=0.f;
+ for(int c=threadIdx.x;c<cols;c+=blockDim.x){float v=__bfloat162float(x[base+c]);sum+=v*v;}
+ partial[threadIdx.x]=sum;__syncthreads();
+ if(threadIdx.x==0){float total=0.f;for(int i=0;i<blockDim.x;i++)total+=partial[i];inverse=rsqrtf(total/cols+eps);}
+ __syncthreads();
+ for(int c=threadIdx.x;c<cols;c+=blockDim.x){
+ float n=__bfloat162float(__float2bfloat16(__bfloat162float(x[base+c])*inverse));
+ float weighted=__bfloat162float(__float2bfloat16(n*__bfloat162float(w[c])));
+ float gate=__bfloat162float(z[base+c]);
+ out[base+c]=__float2bfloat16(weighted*(gate/(1.f+expf(-gate))));
+ }
+}

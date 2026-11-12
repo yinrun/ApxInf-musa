@@ -14,6 +14,12 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    pub fn apxinf_musa_qwen38_gated_rms(x:*const c_void,w:*const c_void,z:*const c_void,out:*mut c_void,rows:i32,cols:i32,eps:f32,stream:*mut c_void)->musaError_t;
+    pub fn apxinf_musa_qwen38_offset_rms(x:*const c_void,w:*const c_void,out:*mut c_void,rows:i32,cols:i32,eps:f32,stream:*mut c_void)->musaError_t;
+    /// Row-wise SiLU(first half) times second half, BF16.
+    pub fn apxinf_musa_qwen38_swiglu_bf16(input: *const c_void, output: *mut c_void,
+        rows: i32, cols: i32, stream: *mut c_void) -> i32;
+
     /// Thread-local diagnostic for a failed muDNN call.
     pub fn apxinf_musa_mudnn_last_error() -> *const std::os::raw::c_char;
     pub fn apxinf_musa_capture_anchor(stream: *mut c_void) -> musaError_t;

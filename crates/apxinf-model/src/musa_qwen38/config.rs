@@ -45,6 +45,12 @@ struct TextConfig {
     rope_theta: Option<f32>,
     rms_norm_eps: Option<f32>,
     head_dim: Option<usize>,
+    rope_parameters: Option<RopeParameters>,
+}
+
+#[derive(Deserialize)]
+struct RopeParameters {
+    rope_theta: Option<f32>,
 }
 
 impl Qwen38Config {
@@ -90,15 +96,53 @@ impl Qwen38Config {
         if let Some(got) = text.head_dim {
             if got != HEAD_DIM { return Err(Error::Other(format!("text_config head_dim={got}, expected {HEAD_DIM}"))); }
         }
+        if let Some(got) = text.rope_parameters.as_ref().and_then(|r| r.rope_theta) {
+            if !got.is_finite() || (got - ROPE_THETA).abs() > 1.0 {
+                return Err(Error::Other(format!("text_config rope_parameters.rope_theta={got}, expected {ROPE_THETA}")));
+            }
+        }
         if let Some(got) = text.rope_theta {
             if (got - ROPE_THETA).abs() > 1.0 { return Err(Error::Other(format!("text_config rope_theta={got}, expected {ROPE_THETA}"))); }
         }
         if let Some(got) = text.rms_norm_eps {
             if (got - RMS_EPS).abs() > 1e-9 { return Err(Error::Other(format!("text_config rms_norm_eps={got}, expected {RMS_EPS}"))); }
         }
-        let _ = value.model_type;
+        if !matches!(value.model_type.as_deref(), Some("qwen3_5" | "qwen3_5_text")) {
+            return Err(Error::Other("expected HF qwen3_5 or qwen3_5_text model_type".into()));
+        }
         Ok(expected)
     }
 }
 
 pub(crate) fn is_full_attention(layer: usize) -> bool { (layer + 1) % 4 == 0 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_wrong_nested_rope_theta() {
+        let value = serde_json::json!({"model_type":"qwen3_5", "text_config":{
+            "hidden_size":5120,"intermediate_size":17408,"num_hidden_layers":64,
+            "num_attention_heads":24,"num_key_value_heads":4,"vocab_size":248320,
+            "head_dim":256,"rope_parameters":{"rope_theta":10000.0}
+        }});
+        let path=std::env::temp_dir().join(format!("qwen38-config-{}.json",std::process::id()));
+        fs::write(&path,serde_json::to_vec(&value).unwrap()).unwrap();
+        let result=Qwen38Config::from_json_file(&path);
+        fs::remove_file(&path).unwrap();
+        assert!(result.is_err(),"nested RoPE settings must not be silently ignored");
+    }
+    #[test]
+    fn rejects_unrelated_model_type_with_matching_dimensions() {
+        let value = serde_json::json!({"model_type":"llama", "text_config":{
+            "hidden_size":5120,"intermediate_size":17408,"num_hidden_layers":64,
+            "num_attention_heads":24,"num_key_value_heads":4,"vocab_size":248320
+        }});
+        let path=std::env::temp_dir().join(format!("qwen38-identity-{}.json",std::process::id()));
+        fs::write(&path,serde_json::to_vec(&value).unwrap()).unwrap();
+        let result=Qwen38Config::from_json_file(&path);
+        fs::remove_file(&path).unwrap();
+        assert!(result.is_err(),"unrelated model family must be rejected before weight loading");
+    }
+
+}

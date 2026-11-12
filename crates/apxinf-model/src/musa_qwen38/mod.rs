@@ -1,4 +1,7 @@
-//! First MUSA Qwen3.8 slice: checkpoint census only; no execution path yet.
+//! HF checkpoint inspection and an isolated eager GDN mixer; no full model runtime yet.
+pub mod model;
+pub mod request;
+pub mod runner;
 mod config;
 mod weights;
 pub(crate) use config::Qwen38Config;

@@ -526,3 +526,78 @@ fn sdpa_rejects_other_device_before_dispatch() {
     let result=qwen38::sdpa_bf16(&ctx,&q,&k,&k,&mut out,false);
     assert!(result.is_err(), "cross-device operand reached vendor dispatch");
 }
+
+#[test]
+fn swiglu_vendor_matches_halves_formula() {
+    let ctx=MusaContext::new(0).unwrap();
+    for n in [8,17408] {
+        let x:Vec<f32>=(0..4*n).map(|i| ((i*7%31) as f32-15.)/8.).collect();
+        let (_,input)=upload_bf16(&ctx,&x,vec![2,2*n]);
+        let (buffer,mut output)=upload_bf16(&ctx,&vec![0.;2*n],vec![2,n]);
+        qwen38::swiglu_bf16(&ctx,&input,&mut output).unwrap();
+        ctx.synchronize().unwrap();
+        for (i,got) in read_bf16(&buffer).iter().enumerate() {
+            let r=i/n;let c=i%n;
+            let g=bf16_from_bits(bf16_bits(x[r*2*n+c])) as f64;
+            let u=bf16_from_bits(bf16_bits(x[r*2*n+n+c])) as f64;
+            let want=g/(1.+(-g).exp())*u;
+            assert!(got.is_finite() && (*got as f64-want).abs()<0.012,"{got} vs {want}");
+        }
+    }
+}
+
+#[test]
+fn attention_projection_split_preserves_head_local_gates() {
+    let ctx=MusaContext::new(0).unwrap();
+    let (tokens,heads,dim)=(2usize,24usize,256usize);
+    let mut values=vec![0.;tokens*heads*2*dim];
+    for t in 0..tokens {for h in 0..heads {for d in 0..dim {
+        let base=(t*heads+h)*2*dim;
+        values[base+d]=(h as f32+1.)/32.+t as f32;
+        values[base+dim+d]=-(h as f32+1.)/32.-t as f32;
+    }}}
+    let (_,packed)=upload_bf16(&ctx,&values,vec![tokens*heads,2*dim]);
+    let (qb,mut q)=upload_bf16(&ctx,&vec![0.;tokens*heads*dim],vec![tokens*heads,dim]);
+    let (gb,mut g)=upload_bf16(&ctx,&vec![0.;tokens*heads*dim],vec![tokens*heads,dim]);
+    qwen38::split_query_and_gate(&ctx,&packed,&mut q,&mut g).unwrap();ctx.synchronize().unwrap();
+    let q=read_bf16(&qb);let g=read_bf16(&gb);
+    for t in 0..tokens {for h in 0..heads {for d in 0..dim {
+        let i=(t*heads+h)*dim+d;
+        assert_eq!(q[i],bf16_from_bits(bf16_bits(values[(t*heads+h)*2*dim+d])));
+        assert_eq!(g[i],bf16_from_bits(bf16_bits(values[(t*heads+h)*2*dim+dim+d])));
+    }}}
+}
+
+#[test]
+fn offset_rms_preserves_f32_scale_until_final_cast() {
+    let ctx=MusaContext::new(0).unwrap();
+    let x:Vec<f32>=(0..256).map(|i|if i<128 {0.75}else{1.0}).collect();
+    let (_,input)=upload_bf16(&ctx,&x,vec![1,256]);
+    let (_,weight)=upload_bf16(&ctx,&vec![0.0030059814453125;256],vec![256]);
+    let (buffer,mut output)=upload_bf16(&ctx,&vec![0.;256],vec![1,256]);
+    qwen38::offset_rms_bf16(&ctx,&input,&weight,&mut output,1e-6).unwrap();
+    ctx.synchronize().unwrap();
+    let got=read_bf16(&buffer);
+    assert_eq!(got[0],0.8515625);
+    for i in 0..256 {
+        let expected=half::bf16::from_f32(x[i]/(0.78125f32+1e-6).sqrt()*(1.+0.0030059814453125)).to_f32();
+        assert_eq!(got[i],expected);
+    }
+}
+
+#[test]
+fn gated_rms_matches_hf_bf16_cast_points() {
+ let ctx=MusaContext::new(0).unwrap();
+ let round=|x:f32|half::bf16::from_f32(x).to_f32();
+ let x:Vec<f32>=(0..256).map(|i|round(0.001*(1.+(i%7) as f32/8.))).collect();
+ let w:Vec<f32>=(0..128).map(|i|round(0.25+(i%5) as f32*0.013)).collect();
+ let z:Vec<f32>=(0..256).map(|i|round([-0.5,0.,0.75][i%3])).collect();
+ let (_,xt)=upload_bf16(&ctx,&x,vec![2,128]);let (_,wt)=upload_bf16(&ctx,&w,vec![128]);
+ let (_,zt)=upload_bf16(&ctx,&z,vec![2,128]);let (ob,mut out)=upload_bf16(&ctx,&vec![0.;256],vec![2,128]);
+ qwen38::gated_rms_bf16(&ctx,&xt,&wt,&zt,&mut out,1e-6).unwrap();ctx.synchronize().unwrap();
+ let got=read_bf16(&ob);
+ for h in 0..2 {let mean=x[h*128..(h+1)*128].iter().map(|v|v*v).sum::<f32>()/128.;
+ for d in 0..128 {let i=h*128+d;let norm=round(x[i]/(mean+1e-6).sqrt());
+ let want=round(round(norm*w[d])*(z[i]/(1.+(-z[i]).exp())));
+ assert!((got[i]-want).abs()<=0.0009765625,"{i}: {} vs {want}",got[i]);}}
+}

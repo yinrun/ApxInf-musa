@@ -496,3 +496,56 @@ pub fn rope(
         )
     }
 }
+
+/// Row-wise BF16 SwiGLU: `[rows, 2*cols]` halves -> `[rows, cols]`.
+pub fn swiglu_bf16(ctx: &MusaContext, input: &Tensor, output: &mut Tensor) -> Result<()> {
+    let dims = dims_of(input);
+    if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 || dims[1] % 2 != 0 {
+        return Err(Error::Other("SwiGLU expects nonempty [rows, 2*cols]".into()));
+    }
+    let (rows,cols) = (dims[0],dims[1]/2);
+    super::contracts::require_dtype_on(ctx,input,DType::BF16,"swiglu","input")?;
+    super::contracts::require_output_tensor(ctx,output,&[rows,cols],"swiglu","output")?;
+    // SAFETY: device, dtype and full contiguous shapes were checked above;
+    // caller-owned tensors remain live through the asynchronous launch.
+    unsafe {
+        ffi::custom::check_mudnn(ffi::custom::apxinf_musa_qwen38_swiglu_bf16(
+            tensor_ptr(input)?,tensor_ptr(output)?,checked_i32("swiglu","rows",rows)?,
+            checked_i32("swiglu","cols",cols)?,ctx.stream().handle()),
+            || "qwen38 SwiGLU".into()).map_err(crate::error::musa_error)
+    }
+}
+
+/// HF offset RMSNorm; the raw offset is added to one in F32, not BF16.
+pub fn offset_rms_bf16(ctx:&MusaContext,input:&Tensor,weight:&Tensor,out:&mut Tensor,eps:f32)->Result<()> {
+    let d=dims_of(input);
+    if d.len()!=2 || d[0]==0 || d[1]==0 || !eps.is_finite() || eps<=0. {
+        return Err(Error::Other("offset RMSNorm requires nonempty matrix and positive finite epsilon".into()));
+    }
+    super::contracts::require_dtype_on(ctx,input,DType::BF16,"offset RMSNorm","input")?;
+    super::contracts::require_dtype_on(ctx,weight,DType::BF16,"offset RMSNorm","weight")?;
+    require_shape(weight,DType::BF16,&[d[1]],"offset RMSNorm","weight")?;
+    super::contracts::require_output_tensor(ctx,out,&d,"offset RMSNorm","output")?;
+    // SAFETY: shapes, types and device ownership checked above.
+    unsafe {check_native(ffi::custom::apxinf_musa_qwen38_offset_rms(
+        tensor_ptr(input)?,tensor_ptr(weight)?,tensor_ptr(out)?,
+        checked_i32("offset RMSNorm","rows",d[0])?,checked_i32("offset RMSNorm","cols",d[1])?,eps,ctx.stream().handle()),"offset RMSNorm")}
+}
+
+/// HF eager gated RMSNorm with explicit BF16 norm/weight cast points.
+pub fn gated_rms_bf16(ctx:&MusaContext,input:&Tensor,weight:&Tensor,gate:&Tensor,out:&mut Tensor,eps:f32)->Result<()> {
+    let d=dims_of(input);
+    if d.len()!=2 || d[0]==0 || d[1]==0 || !eps.is_finite() || eps<=0. {
+        return Err(Error::Other("gated RMSNorm requires nonempty matrix and positive finite epsilon".into()));
+    }
+    for (name,t) in [("input",input),("weight",weight),("gate",gate)] {
+        super::contracts::require_dtype_on(ctx,t,DType::BF16,"gated RMSNorm",name)?;
+    }
+    require_shape(weight,DType::BF16,&[d[1]],"gated RMSNorm","weight")?;
+    require_shape(gate,DType::BF16,&d,"gated RMSNorm","gate")?;
+    super::contracts::require_output_tensor(ctx,out,&d,"gated RMSNorm","output")?;
+    // SAFETY: all operands have validated shapes, dtype and context device.
+    unsafe {check_native(ffi::custom::apxinf_musa_qwen38_gated_rms(
+        tensor_ptr(input)?,tensor_ptr(weight)?,tensor_ptr(gate)?,tensor_ptr(out)?,
+        checked_i32("gated RMSNorm","rows",d[0])?,checked_i32("gated RMSNorm","cols",d[1])?,eps,ctx.stream().handle()),"gated RMSNorm")}
+}
