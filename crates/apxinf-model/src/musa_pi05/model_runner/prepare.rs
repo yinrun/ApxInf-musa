@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 fn allocate_session(
     requirements: &WorkspaceRequirements,
-    device: usize,
+    context: &Context,
+    eligible: bool,
 ) -> Result<ExecutionSession> {
-    ExecutionSession::with_capacity(requirements.bytes, device)
+    ExecutionSession::with_context_capacity(requirements.bytes, context, eligible)
 }
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
@@ -139,6 +140,7 @@ impl CapturedGraph {
 }
 
 struct CaptureBuilder<'a, B: PrepareBlocks> {
+    w4_eligible: bool,
     model: &'a Arc<Pi05Model<B>>,
     backend: &'a Arc<Context>,
     config: &'a Pi05Config,
@@ -204,7 +206,8 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         backend::synchronize(backend)?;
         let session = allocate_session(
             &self.model.workspace_requirements(token_count)?,
-            self.ctx().device_id(),
+            self.ctx(),
+            self.w4_eligible,
         )?;
         // Warm-up and capture resolve providers under the same rule. Left on,
         // autotuning would measure the warm-up's shapes and change the provider
@@ -314,8 +317,10 @@ pub(super) fn capture<B: PrepareBlocks>(
     tokens: &DeviceBuffer,
     count: usize,
     noise: &Tensor,
+    w4_eligible: bool,
 ) -> Result<CapturedGraph> {
     let builder = CaptureBuilder {
+        w4_eligible,
         model,
         backend: model.backend(),
         config: model.config(),
@@ -334,6 +339,7 @@ pub(super) fn capture_loaded(
     noise: &Tensor,
 ) -> Result<CapturedGraph> {
     struct CaptureOperation<'a> {
+        w4_eligible: bool,
         input: CaptureInput<'a>,
         tokens: &'a DeviceBuffer,
         count: usize,
@@ -342,7 +348,7 @@ pub(super) fn capture_loaded(
     impl ModelOperation for CaptureOperation<'_> {
         type Output = CapturedGraph;
         fn run<B: PrepareBlocks>(self, model: &Arc<Pi05Model<B>>) -> Result<Self::Output> {
-            capture(model, self.input, self.tokens, self.count, self.noise)
+            capture(model, self.input, self.tokens, self.count, self.noise, self.w4_eligible)
         }
     }
     let input = match spec.image_layout {
@@ -350,6 +356,7 @@ pub(super) fn capture_loaded(
         None => CaptureInput::Patches(patches),
     };
     model.with_model(CaptureOperation {
+        w4_eligible: model.name() == "w4a16_bf16_expert",
         input,
         tokens,
         count: spec.token_count,

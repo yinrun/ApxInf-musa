@@ -27,6 +27,7 @@ def build_kernel(m, n, k, bm=None, bn=64, bk=64, num_stages=1, paired=None, thre
         bn, threads = 128, 512
     if threads is None:
         threads = 128
+    reuse_group = selected and m == 512 and (m,n,k) in {tuple(op["shape"]) for op in OPS}
     import tilelang
     import tilelang.language as T
     group_size = 16
@@ -45,22 +46,34 @@ def build_kernel(m, n, k, bm=None, bn=64, bk=64, num_stages=1, paired=None, thre
                 T.clear(cc)
                 for ki in T.Pipelined(T.ceildiv(k,bk),num_stages=num_stages):
                     T.copy(A[by*bm,ki*bk],aa)
-                    if paired:
-                        for j,t in T.Parallel(bn,bk//2):
-                            byte=T.Cast("int32",B[bx*bn+j,ki*bk//2+t])
-                            lo=byte & 15
-                            hi=(byte >> 4) & 15
-                            qlo=T.if_then_else(lo>=8,lo-16,lo)
-                            qhi=T.if_then_else(hi>=8,hi-16,hi)
-                            scale=T.Cast("float32",S[bx*bn+j,(ki*bk+2*t)//group_size])
-                            bb[j,2*t]=T.Cast("bfloat16",T.Cast("float32",qlo)*scale)
-                            bb[j,2*t+1]=T.Cast("bfloat16",T.Cast("float32",qhi)*scale)
+                    if reuse_group:
+                        for j,g in T.Parallel(bn,bk//16):
+                            scale=T.Cast("float32",S[bx*bn+j,ki*bk//16+g])
+                            for v in T.unroll(8):
+                                byte=T.Cast("int32",B[bx*bn+j,ki*bk//2+g*8+v])
+                                lo=byte & 15
+                                hi=(byte >> 4) & 15
+                                qlo=T.if_then_else(lo>=8,lo-16,lo)
+                                qhi=T.if_then_else(hi>=8,hi-16,hi)
+                                bb[j,g*16+2*v]=T.Cast("bfloat16",T.Cast("float32",qlo)*scale)
+                                bb[j,g*16+2*v+1]=T.Cast("bfloat16",T.Cast("float32",qhi)*scale)
                     else:
-                        for j,t in T.Parallel(bn,bk):
-                            byte=T.Cast("int32",B[bx*bn+j,(ki*bk+t)//2])
-                            nib=(byte >> ((t%2)*4)) & 15
-                            signed=T.if_then_else(nib>=8,nib-16,nib)
-                            bb[j,t]=T.Cast("bfloat16",T.Cast("float32",signed)*T.Cast("float32",S[bx*bn+j,(ki*bk+t)//group_size]))
+                        if paired:
+                            for j,t in T.Parallel(bn,bk//2):
+                                byte=T.Cast("int32",B[bx*bn+j,ki*bk//2+t])
+                                lo=byte & 15
+                                hi=(byte >> 4) & 15
+                                qlo=T.if_then_else(lo>=8,lo-16,lo)
+                                qhi=T.if_then_else(hi>=8,hi-16,hi)
+                                scale=T.Cast("float32",S[bx*bn+j,(ki*bk+2*t)//group_size])
+                                bb[j,2*t]=T.Cast("bfloat16",T.Cast("float32",qlo)*scale)
+                                bb[j,2*t+1]=T.Cast("bfloat16",T.Cast("float32",qhi)*scale)
+                        else:
+                            for j,t in T.Parallel(bn,bk):
+                                byte=T.Cast("int32",B[bx*bn+j,(ki*bk+t)//2])
+                                nib=(byte >> ((t%2)*4)) & 15
+                                signed=T.if_then_else(nib>=8,nib-16,nib)
+                                bb[j,t]=T.Cast("bfloat16",T.Cast("float32",signed)*T.Cast("float32",S[bx*bn+j,(ki*bk+t)//group_size]))
                     T.gemm(aa,bb,cc,transpose_B=True)
                 T.copy(cc,C[by*bm,bx*bn])
         return kernel

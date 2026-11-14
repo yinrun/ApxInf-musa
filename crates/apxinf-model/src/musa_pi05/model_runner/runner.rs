@@ -358,9 +358,10 @@ impl Pi05ModelRunner {
         token_ids: DeviceBuffer,
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
-        let session = ExecutionSession::with_capacity(
+        let session = ExecutionSession::with_context_capacity(
             self.model.workspace_requirements(spec.token_count)?.bytes,
-            self.backend.device_id(),
+            &self.backend,
+            self.model.name() == "w4a16_bf16_expert",
         )?;
         let inputs = EagerInputs {
             patches,

@@ -25,11 +25,32 @@ use crate::error::musa_error;
 
 const WORKSPACE_ALIGNMENT: usize = 256;
 
+const W4_SCRATCH_LIMIT: usize = 134_217_728;
+
+/// Bound the diagnostic decoded matrix without changing arena accounting.
+fn w4_scratch_bytes(n: usize, k: usize) -> Result<usize> {
+    n.checked_mul(k)
+        .and_then(|elements| elements.checked_mul(2))
+        .filter(|bytes| *bytes > 0 && *bytes <= W4_SCRATCH_LIMIT)
+        .ok_or_else(|| Error::Other("W4 scratch size exceeds the 128 MiB bound".into()))
+}
+
+/// The owner token and stream generation must both remain unchanged.
+/// This pure check does not itself bind or allocate a session.
+fn check_w4_binding(bound: Option<(u64, u64)>, current: (u64, u64)) -> Result<()> {
+    if bound.is_some_and(|identity| identity != current) {
+        return Err(Error::Other("W4 scratch context/stream generation mismatch".into()));
+    }
+    Ok(())
+}
+
+
 /// Persistent device arena used by a fixed-shape graph.
 pub struct GraphWorkspace {
     storage: MusaBuffer,
     offset: Cell<usize>,
     fp8_emulation: Option<Fp8EmulationWorkspace>,
+    w4_scratch: Option<(MusaBuffer, (u64,u64))>,
 }
 
 struct Fp8EmulationWorkspace {
@@ -48,6 +69,7 @@ impl GraphWorkspace {
             storage: MusaBuffer::alloc(capacity_bytes, device).map_err(musa_error)?,
             offset: Cell::new(0),
             fp8_emulation: None,
+            w4_scratch: None,
         })
     }
 
@@ -208,6 +230,32 @@ impl ExecutionSession {
 
     pub fn with_capacity(capacity_bytes: usize, device: usize) -> Result<Self> {
         GraphWorkspace::new(capacity_bytes, device).map(Self::new)
+    }
+
+    /// Explicit diagnostic allocation, separate from the traversal bump arena.
+    pub fn with_w4_capacity(capacity_bytes: usize, ctx: &MusaContext) -> Result<Self> {
+        if is_capturing() { return Err(Error::Other("W4 scratch allocation during capture refused".into())); }
+        let mut workspace = GraphWorkspace::new(capacity_bytes, ctx.device_id())?;
+        workspace.w4_scratch = Some((MusaBuffer::alloc(W4_SCRATCH_LIMIT,ctx.device_id()).map_err(musa_error)?,ctx.scratch_identity()));
+        Ok(Self::new(workspace))
+    }
+
+    pub(crate) fn w4_buffer(&self, ctx: &MusaContext, n: usize, k: usize) -> Result<MusaBuffer> {
+        let bytes = w4_scratch_bytes(n,k)?;
+        let (storage, identity) = self.inner.workspace.w4_scratch.as_ref().ok_or_else(|| Error::Other("W4 scratch was not prepared".into()))?;
+        check_w4_binding(Some(*identity),ctx.scratch_identity())?;
+        if storage.device()!=ctx.device_id() { return Err(Error::Other("W4 scratch device mismatch".into())); }
+        storage.view(0,bytes).map_err(musa_error)
+    }
+
+    /// Diagnostic route is default-off and allocates before preparation/capture.
+    pub fn with_context_capacity(capacity_bytes: usize, ctx: &MusaContext, eligible: bool) -> Result<Self> {
+        if eligible && w4_native_enabled() { Self::with_w4_capacity(capacity_bytes,ctx) }
+        else { Self::with_capacity(capacity_bytes,ctx.device_id()) }
+    }
+
+    pub fn w4_scratch_capacity(&self) -> usize {
+        self.inner.workspace.w4_scratch.as_ref().map_or(0, |(buffer,_)| buffer.len())
     }
 
     pub fn workspace(&self) -> &GraphWorkspace {
@@ -701,4 +749,199 @@ mod tests {
             "an allocation outside a session consumed session arena"
         );
     }
+}
+
+#[cfg(test)]
+mod w4_scratch_contract_tests {
+    use super::*;
+    #[test]
+    fn w4_scratch_capacity_and_binding() {
+        assert_eq!(w4_scratch_bytes(32768, 2048).unwrap(), 134217728);
+        assert_eq!(w4_scratch_bytes(2048, 16384).unwrap(), 67108864);
+        assert!(w4_scratch_bytes(usize::MAX, 2).is_err());
+        assert!(w4_scratch_bytes(32768, 4096).is_err());
+        assert!(check_w4_binding(Some((1,2)), (1,2)).is_ok());
+        assert!(check_w4_binding(Some((1,2)), (2,2)).is_err());
+        assert!(check_w4_binding(Some((1,2)), (1,3)).is_err());
+        assert!(check_w4_binding(None, (1,2)).is_ok());
+    }
+}
+
+#[cfg(all(test, apxinf_musa_available))]
+mod w4_real_scratch_tests {
+    use super::*;
+    #[test]
+    fn physical_w4_graph_retains_scratch_and_rejects_replacement() {
+        use apxinf_core::Graph;
+        use std::sync::Arc;
+        let ctx = Arc::new(MusaContext::new(0).unwrap());
+        let session = ExecutionSession::with_w4_capacity(256, &ctx).unwrap();
+        let weak = Rc::downgrade(&session.inner);
+        let a = MusaBuffer::alloc(128,0).unwrap();
+        let b = MusaBuffer::alloc(128,0).unwrap();
+        let output = MusaBuffer::alloc(128,0).unwrap();
+        b.copy_from_host(&0x4040u16.to_le_bytes().repeat(64)).unwrap();
+        let launch = || -> Result<()> {
+            let scratch = session.w4_buffer(&ctx,32,2)?;
+            unsafe {
+                crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_euler_update_bf16(a.ptr(),b.ptr(),scratch.ptr(),64,1.,ctx.stream().handle())).map_err(musa_error)?;
+                crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_euler_update_bf16(scratch.ptr(),b.ptr(),output.ptr(),64,1.,ctx.stream().handle())).map_err(musa_error)?;
+            }
+            Ok(())
+        };
+        session.prepare(&launch).unwrap();
+        let graph = crate::graph::capture(ctx.clone(),||session.run(&launch)).unwrap();
+        drop(session);
+        assert!(weak.upgrade().is_some());
+        for value in [2f32,7.,-1.] {
+            ctx.synchronize().unwrap();
+            a.copy_from_host(&((value.to_bits()>>16) as u16).to_le_bytes().repeat(64)).unwrap();
+            graph.replay().unwrap();ctx.synchronize().unwrap();
+            let mut bytes=vec![0;128];output.copy_to_host(&mut bytes).unwrap();
+            assert_eq!(bytes,(((value+6.).to_bits()>>16) as u16).to_le_bytes().repeat(64));
+        }
+        ctx.replace_stream().unwrap();
+        assert!(graph.replay().is_err());
+        drop(graph);
+        assert!(weak.upgrade().is_none());
+    }
+    // Exercise the adapted production decode ABI and real native GEMM, not
+    // the original TileLang diagnostic. Sparse BF16 A permits an independent
+    // exact FP32 reference for every output without a host multi-billion GEMM.
+    #[test]
+    fn physical_w4_native_pair_random_bytes_and_changing_graph() {
+        use apxinf_core::{Graph,Shape};
+        use half::bf16;
+        use std::sync::Arc;
+        assert!(w4_native_enabled());
+        for (n,k) in [(32768usize,2048usize),(2048,16384)] {
+            let m=522usize;
+            let ctx=Arc::new(MusaContext::new(0).unwrap());
+            let session=ExecutionSession::with_w4_capacity(256,&ctx).unwrap();
+            let weak=Rc::downgrade(&session.inner);
+            let a=MusaBuffer::alloc(m*k*2,0).unwrap();
+            let b=MusaBuffer::alloc(n*k/2,0).unwrap();
+            let scales=MusaBuffer::alloc(n*k/16*2,0).unwrap();
+            let out=MusaBuffer::alloc(m*n*2,0).unwrap();
+            let aa=a.as_tensor(Shape::new(vec![m,k]),DType::BF16).unwrap();
+            let ss=scales.as_tensor(Shape::new(vec![n,k/16]),DType::BF16).unwrap();
+            let cc=out.as_tensor(Shape::new(vec![m,n]),DType::BF16).unwrap();
+            let launch=|| -> Result<()> {
+                let mut output=cc.clone();
+                crate::ops::w4a16::linear(&ctx,&aa,crate::ops::w4a16::W4A16WeightView {
+                    packed:&b,scales:&ss,k,n,group_size:16,
+                },&mut output)
+            };
+            let mut graph=None;
+            let mut owner=Some(session.clone());
+            // Drop every outer session owner after capture below. The graph
+            // must keep its own session and the shared scratch alive.
+            drop(session);
+            for phase in 0..3usize {
+                ctx.synchronize().unwrap();
+                let mut state=0x12345678u32.wrapping_add(phase as u32*999);
+                let mut packed=vec![0u8;n*k/2];
+                for byte in &mut packed {
+                    state^=state<<13;state^=state>>17;state^=state<<5;
+                    *byte=(state>>8) as u8;
+                }
+                let scale_values:Vec<bf16>=(0..n*k/16).map(|i| {
+                    if (i+phase)%19==0 {bf16::ZERO}
+                    else {bf16::from_f32(((i*7+phase*11)%31+1) as f32/1024.)}
+                }).collect();
+                let scale_bytes:Vec<u8>=scale_values.iter().flat_map(|x|x.to_bits().to_le_bytes()).collect();
+                let mut activation=vec![bf16::ZERO;m*k];
+                for row in 0..m {
+                    for t in 0..4 {
+                        let col=(row*13+phase*29+t*37)%k;
+                        activation[row*k+col]=bf16::from_f32([1.,-0.5,0.25,-1.][t]);
+                    }
+                }
+                let activation_bytes:Vec<u8>=activation.iter().flat_map(|x|x.to_bits().to_le_bytes()).collect();
+                a.copy_from_host(&activation_bytes).unwrap();
+                b.copy_from_host(&packed).unwrap();
+                scales.copy_from_host(&scale_bytes).unwrap();
+                let decoded=|j:usize,col:usize| -> bf16 {
+                    let nib=(packed[j*k/2+col/2]>>((col%2)*4))&15;
+                    let q=if nib>=8 {nib as i32-16} else {nib as i32};
+                    bf16::from_f32(q as f32*scale_values[j*(k/16)+col/16].to_f32())
+                };
+                if phase==0 {
+                    let sess=owner.as_ref().unwrap();
+                    sess.prepare(&launch).unwrap();ctx.synchronize().unwrap();
+                    let scratch=sess.w4_buffer(&ctx,n,k).unwrap();
+                    let mut bytes=vec![0u8;n*k*2];scratch.copy_to_host(&mut bytes).unwrap();
+                    for col in 0..k { for j in 0..n {
+                        let index=(col*n+j)*2;
+                        assert_eq!(u16::from_le_bytes([bytes[index],bytes[index+1]]),decoded(j,col).to_bits(),"KN decode ({j},{col})");
+                    }}
+                    drop(scratch);
+                    graph=Some(crate::graph::capture(ctx.clone(),||sess.run(&launch)).unwrap());
+                    owner.take();
+                    assert!(weak.upgrade().is_some());
+                }
+                graph.as_ref().unwrap().replay().unwrap();ctx.synchronize().unwrap();
+                let mut bytes=vec![0u8;m*n*2];out.copy_to_host(&mut bytes).unwrap();
+                let mut max_error=0f32;
+                for row in 0..m { for j in 0..n {
+                    let mut sum=0f32;
+                    for t in 0..4 {
+                        let col=(row*13+phase*29+t*37)%k;
+                        sum+=activation[row*k+col].to_f32()*decoded(j,col).to_f32();
+                    }
+                    let expected=bf16::from_f32(sum).to_f32();
+                    let index=(row*n+j)*2;
+                    let actual=bf16::from_bits(u16::from_le_bytes([bytes[index],bytes[index+1]])).to_f32();
+                    let delta=(actual-expected).abs();max_error=max_error.max(delta);
+                    assert!(actual.is_finite() && delta<=0.002+0.02*expected.abs(),"pair ({row},{j}) phase{phase}: {actual} vs {expected}");
+                }}
+                eprintln!("native pair {m}x{n}x{k} phase={phase} max_error={max_error}; changed A/packed/scales PASS");
+            }
+            ctx.replace_stream().unwrap();
+            assert!(graph.as_ref().unwrap().replay().is_err());
+            drop(graph);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+    #[test]
+    fn physical_ineligible_session_has_no_w4_allocation() {
+        assert!(w4_native_enabled(), "run with APXINF_MUSA_W4_NATIVE_PAIR=1");
+        let ctx=MusaContext::new(0).unwrap();
+        let plain=ExecutionSession::with_context_capacity(256,&ctx,false).unwrap();
+        assert_eq!(plain.w4_scratch_capacity(),0);
+        assert!(plain.w4_buffer(&ctx,2048,16384).is_err());
+        let eligible=ExecutionSession::with_context_capacity(256,&ctx,true).unwrap();
+        assert_eq!(eligible.w4_scratch_capacity(),W4_SCRATCH_LIMIT);
+        assert_eq!(plain.workspace().capacity(),256);
+    }
+    #[test]
+    fn physical_w4_scratch_reuses_and_rejects_other_stream() {
+        let ctx = MusaContext::new(0).unwrap();
+        let other = MusaContext::new(0).unwrap();
+        let session = ExecutionSession::with_w4_capacity(256, &ctx).unwrap();
+        let first = session.w4_buffer(&ctx, 32768, 2048).unwrap();
+        let second = session.w4_buffer(&ctx, 2048, 16384).unwrap();
+        assert_eq!(first.ptr(), second.ptr());
+        assert_eq!(session.workspace().used(), 0);
+        assert_eq!(first.len(), 134217728);
+        assert!(session.w4_buffer(&other, 2048, 16384).is_err());
+        ctx.replace_stream().unwrap();
+        assert!(session.w4_buffer(&ctx, 2048, 16384).is_err());
+    }
+}
+
+pub(crate) fn w4_native_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("APXINF_MUSA_W4_NATIVE_PAIR").as_deref()==Ok("1"))
+}
+pub(crate) fn w4_session_buffer(ctx: &MusaContext,n: usize,k: usize) -> Result<MusaBuffer> {
+    ACTIVE_SESSION.with(|active| {
+        let inner=active.get();
+        if inner.is_null() { return Err(Error::Other("W4 native pair requires prepared session scratch".into())); }
+        let workspace=&unsafe { &*inner }.workspace;
+        let (storage,identity)=workspace.w4_scratch.as_ref().ok_or_else(||Error::Other("W4 scratch was not allocated before capture".into()))?;
+        check_w4_binding(Some(*identity),ctx.scratch_identity())?;
+        if storage.device()!=ctx.device_id() { return Err(Error::Other("W4 scratch device mismatch".into())); }
+        storage.view(0,w4_scratch_bytes(n,k)?).map_err(musa_error)
+    })
 }

@@ -1087,3 +1087,57 @@ extern "C" musaError_t apxinf_musa_norm_quantize_bf16_int8(
   }
   return musaGetLastError();
 }
+
+extern "C" __global__ void __launch_bounds__(128, 1) w4_decode_gate(unsigned char* __restrict__ B, __mt_bfloat16* __restrict__ S, __mt_bfloat16* __restrict__ W) {
+  extern __shared__ __align__(4096) __mt_bfloat16 tile[];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    int byte = ((int)B[(((((((int)blockIdx.x) * 32768) + ((i >> 1) * 4096)) + ((((int)threadIdx.x) >> 5) * 1024)) + (((int)blockIdx.y) * 32)) + (((int)threadIdx.x) & 31))]);
+    int condval;
+    if ((8 <= ((byte >> ((i & 1) * 4)) & 15))) {
+      condval = (((byte >> ((i & 1) * 4)) & 15) - 16);
+    } else {
+      condval = ((byte >> ((i & 1) * 4)) & 15);
+    }
+    tile[((((i >> 1) * 256) + (((int)threadIdx.x) * 2)) + (i & 1))] = ((__mt_bfloat16)(((float)condval) * ((float)S[(((((((int)blockIdx.x) * 4096) + ((i >> 1) * 512)) + ((((int)threadIdx.x) >> 5) * 128)) + (((int)blockIdx.y) * 4)) + ((((int)threadIdx.x) & 31) >> 3))])));
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int i_1 = 0; i_1 < 16; ++i_1) {
+    W[(((((((int)blockIdx.y) * 2097152) + (i_1 * 131072)) + ((((int)threadIdx.x) >> 5) * 32768)) + (((int)blockIdx.x) * 32)) + (((int)threadIdx.x) & 31))] = tile[((((((int)threadIdx.x) & 31) * 64) + (i_1 * 4)) + (((int)threadIdx.x) >> 5))];
+  }
+}
+
+
+
+extern "C" __global__ void __launch_bounds__(128, 1) w4_decode_down(unsigned char* __restrict__ B, __mt_bfloat16* __restrict__ S, __mt_bfloat16* __restrict__ W) {
+  extern __shared__ __align__(4096) __mt_bfloat16 tile[];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int byte = ((int)B[(((((((int)blockIdx.x) * 262144) + ((i >> 1) * 65536)) + ((((int)threadIdx.x) >> 4) * 8192)) + (((int)blockIdx.y) * 16)) + (((int)threadIdx.x) & 15))]);
+    int condval;
+    if ((8 <= ((byte >> ((i & 1) * 4)) & 15))) {
+      condval = (((byte >> ((i & 1) * 4)) & 15) - 16);
+    } else {
+      condval = ((byte >> ((i & 1) * 4)) & 15);
+    }
+    tile[((((i >> 1) * 256) + (((int)threadIdx.x) * 2)) + (i & 1))] = ((__mt_bfloat16)(((float)condval) * ((float)S[(((((((int)blockIdx.x) * 32768) + ((i >> 1) * 8192)) + ((((int)threadIdx.x) >> 4) * 1024)) + (((int)blockIdx.y) * 2)) + ((((int)threadIdx.x) & 15) >> 3))])));
+  }
+  __syncthreads();
+  #pragma unroll
+  for (int i_1 = 0; i_1 < 8; ++i_1) {
+    W[(((((((int)blockIdx.y) * 65536) + (i_1 * 8192)) + ((((int)threadIdx.x) >> 5) * 2048)) + (((int)blockIdx.x) * 32)) + (((int)threadIdx.x) & 31))] = tile[((((((int)threadIdx.x) & 31) * 32) + (i_1 * 4)) + (((int)threadIdx.x) >> 5))];
+  }
+}
+
+
+
+extern "C" musaError_t apxinf_musa_w4_decode_kn(const void* packed, const void* scales, void* scratch, int n, int k, musaStream_t stream) {
+  if (!packed || !scales || !scratch) return musaErrorInvalidValue;
+  if (n==32768 && k==2048) {
+    w4_decode_gate<<<dim3(1024,32,1),128,4096,stream>>>((unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch);
+  } else if (n==2048 && k==16384) {
+    w4_decode_down<<<dim3(64,512,1),128,2048,stream>>>((unsigned char*)packed,(__mt_bfloat16*)scales,(__mt_bfloat16*)scratch);
+  } else return musaErrorInvalidValue;
+  return musaGetLastError();
+}

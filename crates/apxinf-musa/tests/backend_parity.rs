@@ -27,6 +27,7 @@ struct Knob {
 }
 
 const KNOBS: &[Knob] = &[
+    Knob { name: "APXINF_MUSA_W4_NATIVE_PAIR", counterpart: None, note: "=1 enables diagnostic session-owned 128MiB W4 decode plus native GEMM; default fused" },
     // Current CUDA runtime (Rust and native C++/CUDA).
     Knob {
         name: "APXINF_DISABLE_FA2_SPLITKV",

@@ -1,7 +1,7 @@
 //! A MUSA stream, owned by the context that created it.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use apxinf_core::{Error, Result};
 
@@ -15,6 +15,7 @@ use crate::ffi;
 #[derive(Debug)]
 pub struct MusaStream {
     handle: AtomicPtr<c_void>,
+    generation: AtomicU64,
 }
 
 // SAFETY: a MUSA stream handle is an opaque driver object; the runtime
@@ -36,8 +37,11 @@ impl MusaStream {
     pub fn new() -> Result<Self> {
         Ok(Self {
             handle: AtomicPtr::new(Self::create()?),
+            generation: AtomicU64::new(0),
         })
     }
+
+    pub(crate) fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
 
     pub fn handle(&self) -> *mut c_void {
         self.handle.load(Ordering::Acquire)
@@ -73,6 +77,7 @@ impl MusaStream {
     pub fn replace(&self) -> Result<()> {
         let fresh = Self::create()?;
         self.release(self.handle.swap(fresh, Ordering::AcqRel));
+        self.generation.fetch_add(1, Ordering::AcqRel);
         // What the failed end left in the slot, and whatever the destroy added,
         // describe a stream that no longer exists; the next launch on the
         // replacement would inherit it as its own verdict.

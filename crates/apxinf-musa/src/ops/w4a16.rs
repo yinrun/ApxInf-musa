@@ -31,6 +31,18 @@ pub fn linear(ctx: &MusaContext, a: &Tensor, w: W4A16WeightView<'_>, out: &mut T
         let aa=MusaBuffer::from_tensor(a).map_err(Error::Other)?;
         let ss=MusaBuffer::from_tensor(w.scales).map_err(Error::Other)?;
         let cc=MusaBuffer::from_tensor(out).map_err(Error::Other)?;
+        let native_pair_shape = (dims[0] == 522 && matches!((w.n,w.k),(32768,2048)|(2048,16384)))
+            || (dims[0] == 512 && matches!((w.n,w.k),
+                (3456,1152)|(1152,1152)|(4304,1152)|(1152,4304)));
+        if group==16 && native_pair_shape && crate::workspace::w4_native_enabled() {
+            let scratch=crate::workspace::w4_session_buffer(ctx,w.n,w.k)?;
+            crate::workspace::note_shape(crate::workspace::OperationShape::Gemm {m:dims[0],n:w.n,k:w.k})?;
+            unsafe {
+                crate::ffi::check_runtime(crate::ffi::custom::apxinf_musa_w4_decode_kn(w.packed.ptr(),ss.ptr(),scratch.ptr(),w.n as i32,w.k as i32,ctx.stream().handle())).map_err(Error::Other)?;
+                crate::ffi::mublas::check_mublas(crate::ffi::mublas::apxinf_musa_bf16_gemm(aa.ptr(),scratch.ptr(),cc.ptr(),dims[0] as i32,w.n as i32,w.k as i32,1.,ctx.stream().handle())).map_err(Error::Other)?;
+            }
+            return Ok(());
+        }
         crate::kernels::gemm::launch_w4(ctx,dims[0],w.n,w.k,group,aa.ptr(),w.packed.ptr(),ss.ptr(),cc.ptr())
     }
     #[cfg(not(apxinf_musa_available))]

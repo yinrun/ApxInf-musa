@@ -14,6 +14,7 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    pub fn apxinf_musa_w4_decode_kn(packed: *const c_void, scales: *const c_void, scratch: *mut c_void, n: i32, k: i32, stream: *mut c_void) -> musaError_t;
     /// RMSNorm (norm_bias null, cols 2048) or LayerNorm (cols 1152), optional
     /// bias+residual producer, and row quantization. BF16 inputs/hidden; INT8
     /// output [rows,cols]; FP16 scales [rows+512]; optional F32 inv_c [cols].
