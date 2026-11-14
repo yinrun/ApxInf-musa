@@ -511,7 +511,7 @@ pub fn action_layer_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn action_layer_bf16_with_policies(
+pub(super) fn action_layer_bf16_with_policies(
     ctx: &Context,
     policies: &L3Policies,
     config: GemmaVariantConfig,

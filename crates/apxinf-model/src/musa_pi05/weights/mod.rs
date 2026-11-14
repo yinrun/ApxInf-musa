@@ -8,3 +8,6 @@ mod packing;
 pub use bf16::*;
 pub use host::*;
 pub use int8_dynamic::*;
+
+mod w4a16;
+pub use w4a16::*;

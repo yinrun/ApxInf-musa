@@ -152,14 +152,15 @@ def main() -> int:
 
     artifacts = []
     for index, (py, op) in enumerate(ops):
-        entries = {role: f"kTl{index}_{role}" for role in ROLES}
+        roles = ("gemm",) if op["type"] == "gemm-w4a16" else ROLES
+        entries = {role: f"kTl{index}_{role}" for role in roles}
 
         # 增量：输入身份不变（定义/参数/入口/生成器）且产物未被篡改才复用旧 .o。
         # 输出指纹（fnv64）只回答「磁盘上的 .o 被动过没有」——编辑 .py 不会
         # 改变它，所以命中必须以输入哈希 def_hash 为准（review 修复）。
         cached = {}
         def_hash = op_definition_digest(py, op, entries, target_identity)
-        for role in ROLES:
+        for role in roles:
             target = args.out / f"{op['id']}.{role}.o"
             old_op = old.get(op["id"], {})
             if (target.exists()
@@ -167,11 +168,14 @@ def main() -> int:
                     and old_op.get("fnv64", {}).get(role) == fnv1a(target)):
                 cached[role] = {"file": target.name, "digest": old_op["fnv64"][role]}
 
-        if len(cached) != len(ROLES):
+        if len(cached) != len(roles):
             mod = load_module(py)
-            part_obj, reduce_obj = mod.build(op, entries["part"], entries["reduce"])
-            sources = {"part": generated_source(part_obj), "reduce": generated_source(reduce_obj)}
-            for role in ROLES:
+            if op["type"] == "gemm-w4a16":
+                sources = {"gemm": generated_source(mod.build_kernel(*op["shape"]))}
+            else:
+                part_obj, reduce_obj = mod.build(op, entries["part"], entries["reduce"])
+                sources = {"part": generated_source(part_obj), "reduce": generated_source(reduce_obj)}
+            for role in roles:
                 if role in cached:
                     continue
                 mu_file = args.out / f"{op['id']}.{role}.mu"
@@ -186,16 +190,16 @@ def main() -> int:
         artifacts.append({
             "id": op["id"], "type": op["type"], "shape": list(op["shape"]),
             "status": op["status"],
-            "scratch_bytes": op["tile"]["splits"] * op["shape"][0] * op["shape"][1] * 4,
+            "scratch_bytes": (0 if op["type"] == "gemm-w4a16" else op["tile"]["splits"] * op["shape"][0] * op["shape"][1] * 4),
             "entries": entries,
             "def_hash": def_hash,
-            "files": {role: cached[role]["file"] for role in ROLES},
-            "fnv64": {role: cached[role]["digest"] for role in ROLES},
+            "files": {role: cached[role]["file"] for role in roles},
+            "fnv64": {role: cached[role]["digest"] for role in roles},
         })
 
     seen = set()
     for a in artifacts:
-        key = tuple(a["shape"])
+        key = (a["type"], *a["shape"])
         assert key not in seen, f"duplicate TileLang shape {key}: {a['id']}"
         seen.add(key)
 

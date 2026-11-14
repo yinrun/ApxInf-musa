@@ -565,3 +565,35 @@ APXINF_PI05_TEST_CHECKPOINT=<checkpoint dir> \
 The first runs without a checkpoint. The second needs a real one: it includes
 the capture acceptance test, which builds an eager and a captured plan from one
 loaded model and compares raw action bits under a changed latent.
+
+
+## Experimental W4A16 encoder with BF16 expert
+
+`w4a16_bf16_expert` requires `musa-tilelang` on mp_22. This experimental
+checkpoint uses symmetric signed INT4 G16 with a 0.98 clipping ratio for vision
+transformer projections and language MLP gate/up/down projections. Language
+QKV/output remain BF16: this is not full-language W4 coverage. Group scales and
+activations are BF16, with FP32 accumulation and BF16 output. The entire action
+expert, including adaptive modulation, and glue/embedding/norm retain BF16.
+Weights are packed directly from the floating checkpoint using ties-to-even
+rounding against the stored BF16 scale; no W8 equalization is applied.
+
+The initial compiled profile is two 256-patch views and ten prefix tokens.
+Uncompiled W4 GEMM shapes fail explicitly, including when TileLang is disabled;
+there is no implicit BF16 weight copy or dequantization fallback. The kernel
+unpacks into shared tiles, not a global full-weight scratch allocation.
+The existing BF16 expert may retain its usual NT assembly layouts.
+
+Kernel equivalence to quantized-then-BF16-dequantized weights is distinct from
+full-model quality against floating gold. RTN quality and LIBERO deployment
+acceptance must be reported separately from graph execution and latency.
+
+The current MP22 profile selects BM128/BN64 with 256 threads and paired-nibble
+expansion for the four vision shapes, and BM128/BN128 with 512 threads for the
+two language MLP shapes. Fresh sequential L1 graph measurements (10 samples)
+were 1442.52 ms before this tuning and 918.89 ms afterwards. Exported actions
+were bit-identical. Both builds still failed the unchanged 0.999 gold gate
+(cosine 0.98966096); this is a performance checkpoint, not an accuracy release.
+The reported model-owned weight total is 3,650,229,280 bytes, excluding retained
+expert NT layouts. The less-than-3-GB target is not met. Workspace capacity is
+validated only for the tested profile, not as a general shape/schedule bound.

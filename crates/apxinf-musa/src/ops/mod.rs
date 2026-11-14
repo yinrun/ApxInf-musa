@@ -109,3 +109,5 @@ fn require_workspace(operation: &str, required: usize, limit: usize) -> Result<(
     }
     Ok(())
 }
+
+pub mod w4a16;

@@ -240,6 +240,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             })?;
             Ok::<_, Error>((eager_output, graph))
         })?;
+        eprintln!("[apxinf-memory] arena_reserved_bytes={} arena_used_bytes={}", session.workspace().capacity(), session.workspace().used());
         drop(eager_output);
         let output = captured_output
             .into_inner()

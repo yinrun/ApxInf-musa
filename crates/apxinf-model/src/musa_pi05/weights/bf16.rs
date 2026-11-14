@@ -258,7 +258,7 @@ impl Bf16Weights {
 }
 
 impl Bf16DeviceLayerNorm {
-    fn from_host(weights: &LayerNormWeights, backend: &Context) -> Result<Self> {
+    pub(super) fn from_host(weights: &LayerNormWeights, backend: &Context) -> Result<Self> {
         Ok(Self {
             weight: bf16_to_device(&weights.weight, backend)?,
             bias: bf16_to_device(&weights.bias, backend)?,
@@ -267,7 +267,7 @@ impl Bf16DeviceLayerNorm {
 }
 
 impl Bf16DeviceVisionBlock {
-    fn from_host(weights: &VisionBlockWeights, backend: &Context) -> Result<Self> {
+    pub(super) fn from_host(weights: &VisionBlockWeights, backend: &Context) -> Result<Self> {
         Ok(Self {
             norm1: Bf16DeviceLayerNorm::from_host(&weights.norm1, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
@@ -283,7 +283,7 @@ impl Bf16DeviceVisionBlock {
 }
 
 impl Bf16DeviceLanguageLayer {
-    fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
+    pub(super) fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
         Ok(Self {
             input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
@@ -306,7 +306,7 @@ impl Bf16DeviceLanguageLayer {
 }
 
 impl Bf16DeviceActionLayer {
-    fn from_host(weights: &ActionLayerWeights, backend: &Context) -> Result<Self> {
+    pub(super) fn from_host(weights: &ActionLayerWeights, backend: &Context) -> Result<Self> {
         Ok(Self {
             input_modulation: modulation_to_device(&weights.input_norm, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
@@ -328,7 +328,7 @@ impl Bf16DeviceActionLayer {
     }
 }
 
-fn modulation_to_device(
+pub(super) fn modulation_to_device(
     weights: &AdaRmsNormWeights,
     backend: &Context,
 ) -> Result<Bf16LinearWeights> {

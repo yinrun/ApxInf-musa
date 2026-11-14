@@ -261,3 +261,6 @@ pub(super) fn bias_residual_layer_bf16(
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
+
+pub(super) mod w4a16;
+pub(super) use w4a16::backbone::W4Blocks;

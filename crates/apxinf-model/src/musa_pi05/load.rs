@@ -90,6 +90,16 @@ pub(crate) fn load_model_runner(
     let policies = L3Policies::default();
     install_tactics(&backend, options)?;
     let model = match model_variant {
+        ModelVariantChoice::W4A16Bf16Expert => {
+            let weights = Arc::new(super::weights::W4Weights::from_host(&host_weights, &backend)?);
+            drop(host_weights);
+            let (packed,scales,bf16)=weights.persistent_weight_bytes();
+            eprintln!("[apxinf-memory] w4_packed_bytes={packed} w4_scales_bytes={scales} bf16_weight_bytes={bf16} total_weight_bytes={}",packed+scales+bf16);
+            weights.prepare_assembly_weights(&backend)?;
+            let embeddings=upload_time_embeddings_bf16(&config, &backend)?;
+            ModelVariant::W4 { model: super::model::build_w4_model(Arc::clone(&backend),Arc::clone(&config),weights,policies,&embeddings)? }
+        }
+
         ModelVariantChoice::Int8Dynamic | ModelVariantChoice::Int8DynamicNoEncode => {
             let scope = match model_variant {
                 ModelVariantChoice::Int8DynamicNoEncode => Int8Scope::WithoutEncode,

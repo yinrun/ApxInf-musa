@@ -305,6 +305,14 @@ impl Pi05Config {
         self.graph_workspace_bytes_bf16(token_count)
     }
 
+    /// W4 uses no activation quantization or global dequantization scratch.
+    /// The single-width schedule plus 256 MiB bounds its BF16 temporaries;
+    /// the admitted M522 profile measured 1,987,860,864 bytes high water.
+    pub fn graph_workspace_bytes_w4a16(&self, token_count: usize) -> Result<usize> {
+        self.graph_workspace_bytes(token_count)?.checked_add(256 * 1024 * 1024)
+            .ok_or_else(|| Error::Other("W4 workspace overflow".into()))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.image_size % self.patch_size != 0 {
             return Err(Error::Other(format!(
@@ -507,10 +515,12 @@ pub enum ModelVariantChoice {
     /// expert do not. Everything downstream (dispatch, kernels, captures) is
     /// shared with `int8_dynamic`; only weight preparation differs.
     Int8DynamicNoEncode,
+    W4A16Bf16Expert,
 }
 impl ModelVariantChoice {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::W4A16Bf16Expert => "w4a16_bf16_expert",
             Self::Auto => "auto",
             Self::Bf16 => "bf16",
             Self::Fp8Static => "fp8_static",
@@ -542,6 +552,7 @@ impl std::str::FromStr for ModelVariantChoice {
     type Err = apxinf_core::Error;
     fn from_str(value: &str) -> apxinf_core::Result<Self> {
         match value {
+            "w4a16_bf16_expert" => Ok(Self::W4A16Bf16Expert),
             "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
             "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
             "int8_dynamic_no_encode" => Ok(Self::Int8DynamicNoEncode),

@@ -295,3 +295,31 @@ mod tests {
         }
     }
 }
+
+pub(crate) struct TilelangW4 {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub status: TilelangStatus,
+    pub gemm: ReduceFn,
+    pub init: InitFn,
+    ready: AtomicBool,
+}
+
+pub(crate) fn launch_w4(ctx: &MusaContext, m: usize, n: usize, k: usize, group_size: usize,
+    a: *mut c_void, b: *mut c_void, scales: *mut c_void, out: *mut c_void) -> Result<()> {
+    if group_size != 16 { return Err(Error::Other(format!("unsupported W4 group size {group_size}"))); }
+    let entry = TILELANG_W4.iter().find(|e| !policy_off() && e.m == m && e.n == n && e.k == k && e.status == TilelangStatus::Enabled)
+        .ok_or_else(|| Error::Other(format!("unsupported fused TileLang W4A16 shape {m}x{n}x{k}; no BF16 fallback")))?;
+    crate::workspace::note_shape(crate::workspace::OperationShape::Gemm { m, n, k })?;
+    unsafe {
+        if !entry.ready.load(Ordering::Acquire) {
+            if (entry.init)() != 0 { return Err(Error::Other("W4 kernel init failed".into())); }
+            entry.ready.store(true, Ordering::Release);
+        }
+        if (entry.gemm)(a,b,scales,out,ctx.stream().handle()) != 0 {
+            return Err(Error::Other("W4 kernel launch failed".into()));
+        }
+    }
+    Ok(())
+}

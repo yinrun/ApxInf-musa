@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
                         help="checkpoint directory holding model.safetensors")
     parser.add_argument("--device", default="musa:0", help="MUSA device (default: musa:0)")
     parser.add_argument("--model-variant", default="bf16",
-                        choices=("bf16", "int8_dynamic", "int8_dynamic_no_encode"),
+                        choices=("bf16", "int8_dynamic", "int8_dynamic_no_encode", "w4a16_bf16_expert"),
                         help="PI0.5 variant. `int8_dynamic` quantizes every projection an "
                              "embedded s8mma tile can serve (the ViT patch embedding and the "
                              "action head stay BF16) and needs APXINF_INT8_EQUALIZATION for "
